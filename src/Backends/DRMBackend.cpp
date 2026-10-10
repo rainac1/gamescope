@@ -3933,7 +3933,13 @@ namespace gamescope
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
-			bNeedsFullComposite |= pFrameInfo->bForceFullComposite;
+			// The pan effect moves the base layer and keeps moving it for as long as the
+			// key is held. A plane can carry that offset (CRTC_X/Y), but nothing would
+			// cover the vacated pixels, they would be whatever the CRTC background is, so
+			// composite for the whole hold and let the layer's black border fill them.
+			// Deciding this per frame would flip the plane layout whenever the translation
+			// crosses a texel boundary.
+			bNeedsFullComposite |= pFrameInfo->bPanEffectEngaged;
 
 			if ( g_bOutputHDREnabled )
 			{

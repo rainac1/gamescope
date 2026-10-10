@@ -106,6 +106,31 @@ to where it was.
   the resulting translation on every release, which is the easiest way to
   calibrate `k` and `f`.
 
+### Pixel exactness
+
+The translation is snapped to whole source texels, so the game's frame is moved
+without being resampled: the pan itself introduces no interpolation blur, and a
+layer that is already 1:1 with the output moves in whole output pixels. Holding
+the key without moving, or with less than half a texel of motion, applies
+nothing at all.
+
+It is also clamped to half of the output in each direction, so the picture always
+keeps covering a good part of the screen and can never leave it. Moving the base
+layer out of the output completely is a state no backend can present any more
+(nothing of the layer is visible, so a plane cannot carry it), and games can
+stall when their frames stop reaching the display there. Motion that would push
+the translation past those bounds is not accumulated either, so holding the mouse
+against a limit and then reversing moves the picture back immediately instead of
+first unwinding the excess.
+
+While the effect is engaged the frame is always presented the same way, even on
+the frames where the translation snaps away to nothing, so crossing a texel
+boundary cannot make the presentation path flip back and forth. A 1:1 layer in a
+nested session is then presented with no compositing at all: it is moved by its
+own plane, with the black backing plane below it. Scaled layers, and DRM or
+OpenVR sessions, keep going through the composite, which is still sampled at
+whole source texels.
+
 ### Where the counts come from
 
 Only relative motion is ever accumulated:
@@ -130,10 +155,11 @@ stops turning there. `gamescope_wayland_mouse_forward_relative_motion=0` (or
 is the other way to avoid the problem: it locks the host pointer so the position
 is never clipped, at the cost of the host mouse being captured.
 
-While the effect is active gamescope has to composite the frame instead of
-scanning out planes directly, so a hold costs the same extra latency as
-`--force-composition`. It only moves the picture: what the game receives from
-the mouse and keyboard is unchanged.
+While the effect is active a scaled frame, or a DRM session, has to be composited
+instead of scanned out directly, which costs the same extra latency as
+`--force-composition`; a 1:1 layer in a nested session does not. The effect only
+moves the picture: what the game receives from the mouse and keyboard is
+unchanged.
 
 ### Setting the options
 

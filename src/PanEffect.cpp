@@ -244,4 +244,36 @@ namespace gamescope
         PanEffectComputeTranslationFromDeltas( flDeltaX, flDeltaY, flX, flY );
         return true;
     }
+
+    // The input thread accumulates the deltas under the wlserver lock, this one is
+    // called without it, so update with a compare-exchange loop.
+    static void PanEffectClampDelta( std::atomic<double> &flDelta, double flMin, double flMax )
+    {
+        double flCurrent = flDelta.load( std::memory_order_relaxed );
+        while ( true )
+        {
+            const double flClamped = std::clamp( flCurrent, flMin, flMax );
+            if ( flClamped == flCurrent || flDelta.compare_exchange_weak( flCurrent, flClamped, std::memory_order_relaxed ) )
+                return;
+        }
+    }
+
+    void PanEffectLimitTranslation( double flMinX, double flMaxX, double flMinY, double flMaxY )
+    {
+        const double flRadiansPerCount = double( cv_pan_effect_angle.Get() ) * ( k_flPanEffectPi / 180.0 );
+        const double flFocalPx = double( cv_pan_effect_focal.Get() );
+
+        // The translation is the (possibly inverted) projection of the accumulated
+        // counts, so flip the bounds back to get the counts that may still be
+        // accumulated. The projection is monotone, so clamping the counts clamps the
+        // translation.
+        const double flSign = cv_pan_effect_invert.Get() ? -1.0 : 1.0;
+        const double flCountsAX = flSign * PanEffectCountsForTranslation( flMinX, flRadiansPerCount, flFocalPx );
+        const double flCountsBX = flSign * PanEffectCountsForTranslation( flMaxX, flRadiansPerCount, flFocalPx );
+        const double flCountsAY = flSign * PanEffectCountsForTranslation( flMinY, flRadiansPerCount, flFocalPx );
+        const double flCountsBY = flSign * PanEffectCountsForTranslation( flMaxY, flRadiansPerCount, flFocalPx );
+
+        PanEffectClampDelta( s_flDeltaX, std::min( flCountsAX, flCountsBX ), std::max( flCountsAX, flCountsBX ) );
+        PanEffectClampDelta( s_flDeltaY, std::min( flCountsAY, flCountsBY ), std::max( flCountsAY, flCountsBY ) );
+    }
 }

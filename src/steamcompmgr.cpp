@@ -3503,15 +3503,63 @@ paint_all( global_focus_t *pFocus, bool async )
 		{
 			FrameInfo_t::Layer_t &baseLayer = frameInfo.layers.get( 0 );
 
-			// The composite shader samples at (uv + offset) * scale and offset
-			// is in output pixels, so subtracting moves the image by +pan.
-			baseLayer.offset.x -= float( flPanX );
-			baseLayer.offset.y -= float( flPanY );
+			// The effect is engaged, so the base layer may move on any frame of this
+			// hold. Tell the backends to keep presenting it the way they do while it
+			// moves, even on the frames where the translation snaps away to nothing:
+			// picking the presentation layout per frame would flip it back and forth
+			// across every texel boundary and flash the screen.
+			frameInfo.bPanEffectEngaged = true;
 
-			// A translated layer is not a plain plane scanout anymore. The
-			// vacated pixels stay black because the base layer paints an
-			// opaque border outside of its texture.
-			frameInfo.bForceFullComposite = true;
+			// Bounds the translation is kept within: half an output at most, so the
+			// picture always keeps covering a good part of the screen instead of ending
+			// up as a sliver, and never more than the layer can take, because a layer
+			// with nothing left inside the output cannot be presented on a plane at all
+			// and games can stall when their frames stop reaching the display there.
+			double flMinX = 0.0, flMaxX = 0.0, flMinY = 0.0, flMaxY = 0.0;
+			const bool bHaveBounds = baseLayer.tex != nullptr && g_nOutputWidth > 0 && g_nOutputHeight > 0;
+			if ( bHaveBounds )
+			{
+				const double flMaxPanX = double( g_nOutputWidth ) * 0.5;
+				const double flMaxPanY = double( g_nOutputHeight ) * 0.5;
+				flMinX = std::max( 1.0 - double( baseLayer.integerWidth() ), -flMaxPanX );
+				flMaxX = std::min( double( g_nOutputWidth ) - 1.0, flMaxPanX );
+				flMinY = std::max( 1.0 - double( baseLayer.integerHeight() ), -flMaxPanY );
+				flMaxY = std::min( double( g_nOutputHeight ) - 1.0, flMaxPanY );
+
+				// Stop accumulating motion that is already at a bound, so that holding
+				// the mouse against it does not build up motion that has to be undone
+				// before the picture starts moving back again.
+				gamescope::PanEffectLimitTranslation( flMinX, flMaxX, flMinY, flMaxY );
+
+				flPanX = std::clamp( flPanX, flMinX, flMaxX );
+				flPanY = std::clamp( flPanY, flMinY, flMaxY );
+			}
+
+			// Whole source texels only: the layer is then sampled at the same texel
+			// phase as without the pan, so the picture moves without being resampled
+			// and a 1:1 layer stays on the plain sampler path.
+			double flSnappedX = gamescope::PanEffectSnapToTexels( flPanX, baseLayer.scale.x );
+			double flSnappedY = gamescope::PanEffectSnapToTexels( flPanY, baseLayer.scale.y );
+
+			// Snapping can move the translation by up to half a texel, so keep the
+			// applied value inside the bounds as well.
+			if ( bHaveBounds )
+			{
+				flSnappedX = std::clamp( flSnappedX, flMinX, flMaxX );
+				flSnappedY = std::clamp( flSnappedY, flMinY, flMaxY );
+			}
+
+			// A translation smaller than half a texel is invisible, so it is simply
+			// not applied. The black border of the base layer still fills the vacated
+			// pixels on the frames where it is.
+			if ( flSnappedX != 0.0 || flSnappedY != 0.0 )
+			{
+				// The composite shader samples at (uv + offset) * scale and offset
+				// is in output pixels, so subtracting moves the image by +pan. The
+				// plane paths move a layer by its offset the same way.
+				baseLayer.offset.x -= float( flSnappedX );
+				baseLayer.offset.y -= float( flSnappedY );
+			}
 		}
 	}
 

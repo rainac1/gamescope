@@ -1857,7 +1857,11 @@ namespace gamescope
         bNeedsFullComposite |= g_bColorSliderInUse;
         bNeedsFullComposite |= pFrameInfo->bFadingOut;
         bNeedsFullComposite |= !g_reshade_effect.empty();
-        bNeedsFullComposite |= pFrameInfo->bForceFullComposite;
+        // The pan effect moves the base layer for as long as the key is held. Its
+        // overlay plane could carry that, but the plane path here would leave the
+        // vacated pixels to the VR compositor, so composite for the whole hold and let
+        // the layer's black border fill them.
+        bNeedsFullComposite |= pFrameInfo->bPanEffectEngaged;
         bNeedsFullComposite |= !m_pBackend->UsesModifiers();
 
         if ( g_bOutputHDREnabled )

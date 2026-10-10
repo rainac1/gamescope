@@ -1134,7 +1134,16 @@ namespace gamescope
             bNeedsFullComposite |= g_bColorSliderInUse;
             bNeedsFullComposite |= pFrameInfo->bFadingOut;
             bNeedsFullComposite |= !g_reshade_effect.empty();
-            bNeedsFullComposite |= pFrameInfo->bForceFullComposite;
+
+            // The pan effect moves the base layer, and this backend can present that on
+            // a plane: the layer goes on its own plane positioned by its offset, with
+            // the black backing plane below it filling the vacated pixels. That is only
+            // exact for a 1:1 layer, whose offset is a whole output pixel: a scaled
+            // layer would be moved by whole output pixels and sampled at a shifting
+            // texel phase, so it keeps going through the composite, which stays locked
+            // to whole source texels.
+            const bool bPlaneCanMoveBaseLayer = close_enough( pFrameInfo->layers.get( 0 ).scale.x, 1.0f ) && close_enough( pFrameInfo->layers.get( 0 ).scale.y, 1.0f );
+            bNeedsFullComposite |= pFrameInfo->bPanEffectEngaged && !bPlaneCanMoveBaseLayer;
 
             if ( g_bOutputHDREnabled )
                 bNeedsFullComposite |= g_bHDRItmEnable;
@@ -1149,7 +1158,13 @@ namespace gamescope
                 bool bNeedsBacking = true;
                 if ( pFrameInfo->layers.count() >= 1 )
                 {
-                    if ( pFrameInfo->layers.get( 0 ).isScreenSize() &&
+                    // While the pan effect is engaged the base layer is presented on its
+                    // own plane, which needs the backing plane below it on every frame of
+                    // the hold, including the ones where the translation is zero. Flipping
+                    // the layout in the middle of a hold unmaps and remaps surfaces and
+                    // flashes black.
+                    if ( !pFrameInfo->bPanEffectEngaged &&
+                         pFrameInfo->layers.get( 0 ).isScreenSize() &&
                          close_enough( pFrameInfo->layers.get( 0 ).offset.x, 0.0f ) &&
                          close_enough( pFrameInfo->layers.get( 0 ).offset.y, 0.0f ) &&
                          !pFrameInfo->layers.get( 0 ).hasAlpha() )
@@ -1714,18 +1729,47 @@ namespace gamescope
         {
             pWaylandFb->OnCompositorAcquire();
 
+            // Where the layer lands in output pixels. A layer that was moved past the
+            // left/top edge (the pan effect moves the base layer both ways) would sit at
+            // a negative plane position, which the host compositor does not reliably
+            // draw at all: the layer vanishes and only whatever is behind it is left.
+            // Crop the source instead and keep the plane at the origin.
+            int32_t nDestX = int32_t( -pLayer->offset.x );
+            int32_t nDestY = int32_t( -pLayer->offset.y );
+            double flSrcX = 0.0;
+            double flSrcY = 0.0;
+            double flSrcWidth = double( pLayer->tex->width() );
+            double flSrcHeight = double( pLayer->tex->height() );
+            int32_t nDstWidth = int32_t( ceil( pLayer->tex->width() / double( pLayer->scale.x ) ) );
+            int32_t nDstHeight = int32_t( ceil( pLayer->tex->height() / double( pLayer->scale.y ) ) );
+
+            if ( nDestX < 0 )
+            {
+                flSrcX += double( -nDestX ) * pLayer->scale.x;
+                flSrcWidth -= double( -nDestX ) * pLayer->scale.x;
+                nDstWidth += nDestX;
+                nDestX = 0;
+            }
+            if ( nDestY < 0 )
+            {
+                flSrcY += double( -nDestY ) * pLayer->scale.y;
+                flSrcHeight -= double( -nDestY ) * pLayer->scale.y;
+                nDstHeight += nDestY;
+                nDestY = 0;
+            }
+
             Present(
                 ClipPlane( WaylandPlaneState
                 {
                     .pBuffer     = pBuffer,
-                    .nDestX      = int32_t( -pLayer->offset.x ),
-                    .nDestY      = int32_t( -pLayer->offset.y ),
-                    .flSrcX      = 0.0,
-                    .flSrcY      = 0.0,
-                    .flSrcWidth  = double( pLayer->tex->width() ),
-                    .flSrcHeight = double( pLayer->tex->height() ),
-                    .nDstWidth   = int32_t( ceil( pLayer->tex->width() / double( pLayer->scale.x ) ) ),
-                    .nDstHeight  = int32_t( ceil( pLayer->tex->height() / double( pLayer->scale.y ) ) ),
+                    .nDestX      = nDestX,
+                    .nDestY      = nDestY,
+                    .flSrcX      = flSrcX,
+                    .flSrcY      = flSrcY,
+                    .flSrcWidth  = flSrcWidth,
+                    .flSrcHeight = flSrcHeight,
+                    .nDstWidth   = nDstWidth,
+                    .nDstHeight  = nDstHeight,
                     .eColorspace = pLayer->colorspace,
                     .pHDRMetadata = pLayer->hdr_metadata_blob,
                     .bOpaque     = pLayer->zpos == g_zposBase,

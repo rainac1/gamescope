@@ -294,9 +294,12 @@ struct FrameInfo_t
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 	int nUpscaleSharpness = 0;
 	bool bFadingOut;
-	// Set when a layer cannot be expressed as a plane scanout (eg. the screen
-	// pan effect translated the base layer), so the backend has to composite.
-	bool bForceFullComposite = false;
+	// Set while the screen pan effect is engaged, ie. while the key is held and
+	// motion has been accumulated. The base layer's transform can then change on any
+	// frame, so a backend has to keep the presentation layout it needs for that for
+	// the whole hold: choosing it from the current translation would flip the layout
+	// every time the translation crosses a texel boundary, which flashes.
+	bool bPanEffectEngaged = false;
 	BlurMode blurLayer0;
 	int blurRadius;
 
