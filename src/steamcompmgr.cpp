@@ -92,6 +92,7 @@
 #include "edid.h"
 #include "hdmi.h"
 #include "convar.h"
+#include "PanEffect.h"
 #include "Script/Script.h"
 #include "refresh_rate.h"
 #include "commit.h"
@@ -3490,6 +3491,27 @@ paint_all( global_focus_t *pFocus, bool async )
 		{
 			frameInfo.shaperLut[i] = g_ColorMgmtLuts[i].vk_lut1d;
 			frameInfo.lut3D[i] = g_ColorMgmtLuts[i].vk_lut3d;
+		}
+	}
+
+	// Screen pan effect: translate the game's frame in output pixels as the very
+	// last thing before it goes to the display. Only the layer transform is
+	// touched, so input mapping and the rest of the scenegraph are unaffected.
+	{
+		double flPanX = 0.0, flPanY = 0.0;
+		if ( frameInfo.layers.count() > 0 && gamescope::PanEffectGetTranslation( flPanX, flPanY ) )
+		{
+			FrameInfo_t::Layer_t &baseLayer = frameInfo.layers.get( 0 );
+
+			// The composite shader samples at (uv + offset) * scale and offset
+			// is in output pixels, so subtracting moves the image by +pan.
+			baseLayer.offset.x -= float( flPanX );
+			baseLayer.offset.y -= float( flPanY );
+
+			// A translated layer is not a plain plane scanout anymore. The
+			// vacated pixels stay black because the base layer paints an
+			// opaque border outside of its texture.
+			frameInfo.bForceFullComposite = true;
 		}
 	}
 

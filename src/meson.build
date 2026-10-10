@@ -124,6 +124,7 @@ src = [
   'x11cursor.cpp',
   'InputEmulation.cpp',
   'LibInputHandler.cpp',
+  'PanEffect.cpp',
 ]
 
 luajit_dep = dependency( 'luajit' )

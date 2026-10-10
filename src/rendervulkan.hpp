@@ -294,6 +294,9 @@ struct FrameInfo_t
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 	int nUpscaleSharpness = 0;
 	bool bFadingOut;
+	// Set when a layer cannot be expressed as a plane scanout (eg. the screen
+	// pan effect translated the base layer), so the backend has to composite.
+	bool bForceFullComposite = false;
 	BlurMode blurLayer0;
 	int blurRadius;
 

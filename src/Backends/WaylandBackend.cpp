@@ -576,6 +576,12 @@ namespace gamescope
         std::atomic<std::shared_ptr<zwp_relative_pointer_v1>> m_pRelativePointer = nullptr;
         std::unordered_set<uint32_t> m_uScancodesHeld;
 
+        // A second relative pointer, kept alive even when the cursor is driven by
+        // the absolute path, purely so the pan effect gets the host's raw deltas.
+        // Unlike differencing absolute positions it keeps counting when the host
+        // pointer is clipped at a screen edge. Only touched from the input thread.
+        zwp_relative_pointer_v1 *m_pPanRelativePointer = nullptr;
+
         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
         static const wl_registry_listener s_RegistryListener;
 
@@ -605,6 +611,9 @@ namespace gamescope
 
 	    void Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel );
         static const zwp_relative_pointer_v1_listener s_RelativePointerListener;
+
+        void Wayland_PanRelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel );
+        static const zwp_relative_pointer_v1_listener s_PanRelativePointerListener;
     };
     const wl_registry_listener CWaylandInputThread::s_RegistryListener =
     {
@@ -641,6 +650,10 @@ namespace gamescope
     const zwp_relative_pointer_v1_listener CWaylandInputThread::s_RelativePointerListener =
     {
         .relative_motion = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_RelativePointer_RelativeMotion ),
+    };
+    const zwp_relative_pointer_v1_listener CWaylandInputThread::s_PanRelativePointerListener =
+    {
+        .relative_motion = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_PanRelativePointer_RelativeMotion ),
     };
 
     class CWaylandBackend : public CBaseBackend
@@ -1085,6 +1098,7 @@ namespace gamescope
             bNeedsFullComposite |= g_bColorSliderInUse;
             bNeedsFullComposite |= pFrameInfo->bFadingOut;
             bNeedsFullComposite |= !g_reshade_effect.empty();
+            bNeedsFullComposite |= pFrameInfo->bForceFullComposite;
 
             if ( g_bOutputHDREnabled )
                 bNeedsFullComposite |= g_bHDRItmEnable;
@@ -3042,6 +3056,13 @@ namespace gamescope
         else if ( !strcmp( pInterface, zwp_relative_pointer_manager_v1_interface.name ) )
         {
             m_pRelativePointerManager = (zwp_relative_pointer_manager_v1 *)wl_registry_bind( pRegistry, uName, &zwp_relative_pointer_manager_v1_interface, 1u );
+
+            // In case the seat's capabilities arrived first.
+            if ( m_pPointer && !m_pPanRelativePointer )
+            {
+                m_pPanRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
+                zwp_relative_pointer_v1_add_listener( m_pPanRelativePointer, &s_PanRelativePointerListener, this );
+            }
         }
     }
 
@@ -3053,6 +3074,12 @@ namespace gamescope
         {
             if ( m_pPointer )
             {
+                if ( m_pPanRelativePointer )
+                {
+                    zwp_relative_pointer_v1_destroy( m_pPanRelativePointer );
+                    m_pPanRelativePointer = nullptr;
+                }
+
                 wl_pointer_release( m_pPointer );
                 m_pPointer = nullptr;
             }
@@ -3060,6 +3087,17 @@ namespace gamescope
             {
                 m_pPointer = wl_seat_get_pointer( m_pSeat );
                 wl_pointer_add_listener( m_pPointer, &s_PointerListener, this );
+
+                // Kept for the whole lifetime of the pointer, unlike the relative
+                // pointer of the relative mouse mode which only exists while the
+                // host pointer is locked. The pan effect wants raw deltas in both
+                // cases, and differencing absolute positions would be clipped at a
+                // screen edge.
+                if ( m_pRelativePointerManager && !m_pPanRelativePointer )
+                {
+                    m_pPanRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
+                    zwp_relative_pointer_v1_add_listener( m_pPanRelativePointer, &s_PanRelativePointerListener, this );
+                }
             }
         }
 
@@ -3319,6 +3357,25 @@ namespace gamescope
 
         wlserver_lock();
         wlserver_mousemotion( wl_fixed_to_double( fDxUnaccel ), wl_fixed_to_double( fDyUnaccel ), ++m_uFakeTimestamp );
+        wlserver_unlock();
+    }
+
+    void CWaylandInputThread::Wayland_PanRelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel )
+    {
+        // The relative mouse mode drives the cursor and accumulates through its
+        // own object; only step in when it is not doing that, or the deltas would
+        // be counted twice. It is fed whether or not an application asked for a
+        // locked pointer, so the pan effect gets raw, unclipped deltas either way.
+        const bool bRelativeModeTakesIt =
+            m_pRelativePointer.load() != nullptr &&
+            m_pBackend->m_bPointerLocked &&
+            ( cv_wayland_mouse_relmotion_without_keyboard_focus || m_bKeyboardEntered );
+
+        if ( bRelativeModeTakesIt )
+            return;
+
+        wlserver_lock();
+        wlserver_raw_relative_motion( wl_fixed_to_double( fDxUnaccel ), wl_fixed_to_double( fDyUnaccel ) );
         wlserver_unlock();
     }
 

@@ -3933,6 +3933,7 @@ namespace gamescope
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
+			bNeedsFullComposite |= pFrameInfo->bForceFullComposite;
 
 			if ( g_bOutputHDREnabled )
 			{

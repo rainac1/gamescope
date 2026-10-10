@@ -27,6 +27,7 @@
 #include "rendervulkan.hpp"
 #include "wlserver.hpp"
 #include "convar.h"
+#include "PanEffect.h"
 #include "gpuvis_trace_utils.h"
 #include "Utils/Defer.h"
 #include "Utils/Parsers.h"
@@ -74,6 +75,11 @@ const struct option *gamescope_options = (struct option[]){
 	{ "prefer-vk-device", required_argument, 0 },
 	{ "expose-wayland", no_argument, 0 },
 	{ "mouse-sensitivity", required_argument, nullptr, 's' },
+	{ "pan-effect-key", required_argument, nullptr, 0 },
+	{ "pan-effect-angle", required_argument, nullptr, 0 },
+	{ "pan-effect-focal", required_argument, nullptr, 0 },
+	{ "pan-effect-invert", no_argument, nullptr, 0 },
+	{ "pan-effect-disable", no_argument, nullptr, 0 },
 	{ "mangoapp", no_argument, nullptr, 0 },
 	{ "adaptive-sync", no_argument, nullptr, 0 },
 
@@ -183,6 +189,11 @@ const char usage[] =
 	"  --sharpness, --fsr-sharpness   upscaler sharpness from 0 (max) to 20 (min)\n"
 	"  --expose-wayland               support wayland clients using xdg-shell\n"
 	"  -s, --mouse-sensitivity        multiply mouse movement by given decimal number\n"
+	"  --pan-effect-key               key that drives the screen pan effect while held (xkb keysym name, default: Alt)\n"
+	"  --pan-effect-angle             pan angle in degrees per accumulated mouse count, default: 0.022\n"
+	"  --pan-effect-focal             focal length in pixels used to project the pan angle, default: 720\n"
+	"  --pan-effect-invert            invert the pan direction\n"
+	"  --pan-effect-disable           disable the screen pan effect\n"
 	"  --backend                      select rendering backend\n"
 	"                                     auto => autodetect (default)\n"
 #if HAVE_DRM
@@ -859,6 +870,16 @@ int main(int argc, char **argv)
 								
 						}
 					}
+				} else if (strcmp(opt_name, "pan-effect-key") == 0) {
+					gamescope::cv_pan_effect_key = std::string{ optarg };
+				} else if (strcmp(opt_name, "pan-effect-angle") == 0) {
+					gamescope::cv_pan_effect_angle = parse_float( optarg, opt_name );
+				} else if (strcmp(opt_name, "pan-effect-focal") == 0) {
+					gamescope::cv_pan_effect_focal = parse_float( optarg, opt_name );
+				} else if (strcmp(opt_name, "pan-effect-invert") == 0) {
+					gamescope::cv_pan_effect_invert = true;
+				} else if (strcmp(opt_name, "pan-effect-disable") == 0) {
+					gamescope::cv_pan_effect_enabled = false;
 				}
 				break;
 			case '?':

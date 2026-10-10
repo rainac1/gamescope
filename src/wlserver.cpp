@@ -66,6 +66,7 @@
 #include "xwayland_ctx.hpp"
 #include "refresh_rate.h"
 #include "InputEmulation.h"
+#include "PanEffect.h"
 #include "commit.h"
 #include "Timeline.h"
 #include "Utils/Process.h"
@@ -300,6 +301,9 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 
 	xkb_keycode_t keycode = event->keycode + 8;
 	xkb_keysym_t keysym = xkb_state_key_get_one_sym(keyboard->xkb_state, keycode);
+
+	// The pan key is observed, never consumed: the game still sees it.
+	gamescope::PanEffectObserveKey( keysym, event->state == WL_KEYBOARD_KEY_STATE_PRESSED );
 
 #if HAVE_SESSION
 	if (wlserver.wlr.session && event->state == WL_KEYBOARD_KEY_STATE_PRESSED && keysym >= XKB_KEY_XF86Switch_VT_1 && keysym <= XKB_KEY_XF86Switch_VT_12) {
@@ -1708,7 +1712,10 @@ static void handle_session_active( struct wl_listener *listener, void *data )
 {
 	// Releases delivered while another VT owns input never reach us.
 	if ( !wlserver.wlr.session->active )
+	{
 		wlserver.mapPressedHotkeyKeys.clear();
+		gamescope::PanEffectReset();
+	}
 
 	GetBackend()->DirtyState( wlserver.wlr.session->active, wlserver.wlr.session->active );
 	wl_log.infof( "Session %s", wlserver.wlr.session->active ? "resumed" : "paused" );
@@ -2634,6 +2641,10 @@ void wlserver_key( uint32_t key, bool press, uint32_t time )
 
 	wlr_keyboard *keyboard = wlserver.wlr.virtual_keyboard_device;
 
+	xkb_keycode_t keycode = key + 8;
+	xkb_keysym_t keysym = xkb_state_key_get_one_sym( keyboard->xkb_state, keycode );
+	gamescope::PanEffectObserveKey( keysym, press );
+
 	if ( !wlserver_process_hotkeys( keyboard, key, press ) )
 	{
 		assert( keyboard != nullptr );
@@ -3066,6 +3077,11 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 {
 	assert( wlserver_is_lock_held() );
 
+	// Accumulate the raw relative motion before anything else can drop it: a
+	// locked pointer (the usual FPS case) returns early below.
+	if ( gamescope::PanEffectAccumulateMotion( dx, dy ) )
+		bump_input_counter();
+
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
@@ -3093,6 +3109,18 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 
 	wlr_seat_pointer_notify_motion( wlserver.wlr.seat, time, sx, sy );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+}
+
+void wlserver_raw_relative_motion( double dx, double dy )
+{
+	assert( wlserver_is_lock_held() );
+
+	// Relative deltas that must not move gamescope's cursor: either the absolute
+	// path, or the nested relative mouse mode, is already driving that. Only the
+	// pan effect wants these, and it wants them rather than the alternatives
+	// because the host does not clip them at a screen edge.
+	if ( gamescope::PanEffectAccumulateMotion( dx, dy ) )
+		bump_input_counter();
 }
 
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
