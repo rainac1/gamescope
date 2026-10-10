@@ -10707,7 +10707,7 @@ steamcompmgr_main(int argc, char **argv)
 					pPaintFocus->cursor->UpdatePosition();
 			}
 
-			if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
+			if ( pPaintFocus->GetNestedHints() )
 			{
 				const bool bImageEmpty =
 					( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
@@ -10721,7 +10721,9 @@ steamcompmgr_main(int argc, char **argv)
 
 				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
 
-				const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
+				// --force-grab-cursor asks for this unconditionally. Asking every frame
+				// also re-establishes the lock if the host revoked it behind our back.
+				const bool bRelativeMouseMode = g_bForceRelativeMouse || ( bImageEmpty && bHasPointerConstraint && !bExcludedAppId );
 
 				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
 			}

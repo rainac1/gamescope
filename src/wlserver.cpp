@@ -348,11 +348,11 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 	bump_input_counter();
 }
 
-static void wlserver_perform_rel_pointer_motion(double unaccel_dx, double unaccel_dy)
+static void wlserver_perform_rel_pointer_motion(double dx, double dy, double dx_unaccel, double dy_unaccel)
 {
 	assert( wlserver_is_lock_held() );
 
-	wlr_relative_pointer_manager_v1_send_relative_motion( wlserver.relative_pointer_manager, wlserver.wlr.seat, 0, unaccel_dx, unaccel_dy, unaccel_dx, unaccel_dy );
+	wlr_relative_pointer_manager_v1_send_relative_motion( wlserver.relative_pointer_manager, wlserver.wlr.seat, 0, dx, dy, dx_unaccel, dy_unaccel );
 }
 
 static void wlserver_handle_pointer_motion(struct wl_listener *listener, void *data)
@@ -3085,7 +3085,7 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
-	wlserver_perform_rel_pointer_motion( dx, dy );
+	wlserver_perform_rel_pointer_motion( dx, dy, dx, dy );
 
 	if ( !wlserver_apply_constraint( &dx, &dy ) )
 	{
@@ -3121,6 +3121,23 @@ void wlserver_raw_relative_motion( double dx, double dy )
 	// because the host does not clip them at a screen edge.
 	if ( gamescope::PanEffectAccumulateMotion( dx, dy ) )
 		bump_input_counter();
+}
+
+void wlserver_forward_relative_motion( double dx, double dy, double dx_unaccel, double dy_unaccel )
+{
+	assert( wlserver_is_lock_held() );
+
+	// The nested backends get these from the host, which keeps reporting them when
+	// it clips the absolute pointer position at a screen edge. Hand them to clients
+	// the same way the libinput path does, otherwise relative and raw input (mouse
+	// look) stops as soon as the host pointer is pinned against an edge. Callers
+	// submit this in the same pointer frame as the absolute motion.
+	dx *= g_mouseSensitivity;
+	dy *= g_mouseSensitivity;
+	dx_unaccel *= g_mouseSensitivity;
+	dy_unaccel *= g_mouseSensitivity;
+
+	wlserver_perform_rel_pointer_motion( dx, dy, dx_unaccel, dy_unaccel );
 }
 
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )

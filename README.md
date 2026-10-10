@@ -121,6 +121,15 @@ Only relative motion is ever accumulated:
   engaged. A compositor that sends absolute motion without relative motion cannot
   drive the effect in nested mode.
 
+Those same unclipped deltas are forwarded to clients in nested mode, together
+with the absolute motion and in one `wl_pointer.frame`, the way the libinput path
+does it. Otherwise an application that reads relative or raw mouse input (mouse
+look) only sees the absolute position, which the host pins at a screen edge, and
+stops turning there. `gamescope_wayland_mouse_forward_relative_motion=0` (or
+`wayland_mouse_forward_relative_motion=0`) turns that off. `--force-grab-cursor`
+is the other way to avoid the problem: it locks the host pointer so the position
+is never clipped, at the cost of the host mouse being captured.
+
 While the effect is active gamescope has to composite the frame instead of
 scanning out planes directly, so a hold costs the same extra latency as
 `--force-composition`. It only moves the picture: what the game receives from

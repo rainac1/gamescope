@@ -536,6 +536,10 @@ namespace gamescope
 	}
 	void CSDLBackend::SetRelativeMouseMode( bool bRelative )
 	{
+		// steamcompmgr asks for this every frame, don't queue an event per frame.
+		if ( m_bApplicationGrabbed == bRelative )
+			return;
+
 		m_bApplicationGrabbed = bRelative;
 		PushUserEvent( GAMESCOPE_SDL_EVENT_GRAB );
 	}

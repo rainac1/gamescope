@@ -273,6 +273,7 @@ void wlserver_clear_dropdowns();
 void wlserver_notify_dropdown( struct wlr_surface *wlrsurface, int nX, int nY );
 void wlserver_mousemotion( double x, double y, uint32_t time );
 void wlserver_raw_relative_motion( double dx, double dy );
+void wlserver_forward_relative_motion( double dx, double dy, double dx_unaccel, double dy_unaccel );
 void wlserver_mousehide();
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
 void wlserver_mousebutton( int button, bool press, uint32_t time );

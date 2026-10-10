@@ -121,6 +121,7 @@ namespace gamescope
 
     gamescope::ConVar<bool> cv_wayland_mouse_warp_without_keyboard_focus( "wayland_mouse_warp_without_keyboard_focus", true, "Should we only forward mouse warps to the app when we have keyboard focus?" );
     gamescope::ConVar<bool> cv_wayland_mouse_relmotion_without_keyboard_focus( "wayland_mouse_relmotion_without_keyboard_focus", false, "Should we only forward mouse relative motion to the app when we have keyboard focus?" );
+    gamescope::ConVar<bool> cv_wayland_mouse_forward_relative_motion( "wayland_mouse_forward_relative_motion", true, "Should we forward the host's unclipped relative motion to the app while the cursor follows the absolute position? Keeps relative and raw input alive when the host clips the pointer at a screen edge." );
     gamescope::ConVar<bool> cv_wayland_use_modifiers( "wayland_use_modifiers", true, "Use DMA-BUF modifiers?" );
 
     gamescope::ConVar<float> cv_wayland_hdr10_saturation_scale( "wayland_hdr10_saturation_scale", 1.0, "Saturation scale for HDR10 content by gamut expansion. 1.0 - 1.2 is a good range to play with." );
@@ -513,6 +514,17 @@ namespace gamescope
         .release = WAYLAND_USERDATA_TO_THIS( CWaylandFb, Wayland_Buffer_Release ),
     };
 
+    // wlserver_touchmotion() drives the pointer from the absolute host position in
+    // these modes only. The touch modes either send no pointer motion at all or
+    // derive their own relative motion from that position.
+    static bool TouchClickModeDrivesPointer( TouchClickMode eMode )
+    {
+        return eMode == TouchClickModes::Hover ||
+               eMode == TouchClickModes::Left ||
+               eMode == TouchClickModes::Right ||
+               eMode == TouchClickModes::Middle;
+    }
+
     class CWaylandInputThread
     {
     public:
@@ -534,6 +546,15 @@ namespace gamescope
         void SetRelativePointer( bool bRelative );
 
     private:
+
+        // True while the host honors our pointer lock and the relative pointer is
+        // therefore what drives the cursor.
+        bool IsRelativeMouseModeActive() const;
+
+        // Relative motion collected from the pan relative pointer, delivered to
+        // clients in the caller's current pointer frame (wlserver lock held).
+        void FlushPendingRelativeMotion();
+        void ClearPendingRelativeMotion();
 
         void HandleKey( uint32_t uKey, bool bPressed );
 
@@ -581,6 +602,17 @@ namespace gamescope
         // Unlike differencing absolute positions it keeps counting when the host
         // pointer is clipped at a screen edge. Only touched from the input thread.
         zwp_relative_pointer_v1 *m_pPanRelativePointer = nullptr;
+
+        // Host relative motion seen while the cursor is driven by the absolute
+        // position. It is handed to clients together with the next absolute motion so
+        // that both end up in the same wl_pointer.frame: clients use that to tell that
+        // the absolute motion is already covered and must not be counted again.
+        // Only touched from the input thread.
+        double m_flPendingRelativeDX = 0.0;
+        double m_flPendingRelativeDY = 0.0;
+        double m_flPendingRelativeDXUnaccel = 0.0;
+        double m_flPendingRelativeDYUnaccel = 0.0;
+        bool m_bHasPendingRelativeMotion = false;
 
         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
         static const wl_registry_listener s_RegistryListener;
@@ -853,6 +885,10 @@ namespace gamescope
         wl_touch *m_pTouch = nullptr;
         zwp_locked_pointer_v1 *m_pLockedPointer = nullptr;
 		bool m_bPointerLocked = false;
+        // The host can take a lock away again at any time (KWin breaks pointer
+        // constraints when the focus changes). Remember it so the next request can
+        // re-establish the lock instead of leaving input dead.
+        bool m_bPointerLockRevoked = false;
         wl_surface *m_pLockedSurface = nullptr;
         zwp_relative_pointer_v1 *m_pRelativePointer = nullptr;
 
@@ -2453,36 +2489,44 @@ namespace gamescope
         if ( !m_pPointer )
             return;
 
-        if ( !!bRelative != !!m_pLockedPointer || ( pSurface != m_pLockedSurface && bRelative ) )
+        // A revoked lock is as good as gone, so a caller that still wants relative
+        // mouse mode gets a fresh one below.
+        const bool bLockActive = m_pLockedPointer && !m_bPointerLockRevoked;
+
+        const bool bCreateLock = bRelative && ( !bLockActive || pSurface != m_pLockedSurface );
+        const bool bDestroyLock = m_pLockedPointer && ( !bRelative || bCreateLock );
+
+        if ( !bCreateLock && !bDestroyLock )
+            return;
+
+        if ( bDestroyLock )
         {
-            if ( m_pLockedPointer )
-            {
-                assert( m_pRelativePointer );
+            assert( m_pRelativePointer );
 
-                zwp_locked_pointer_v1_destroy( m_pLockedPointer );
-                m_pLockedPointer = nullptr;
-                m_bPointerLocked = false;
+            zwp_locked_pointer_v1_destroy( m_pLockedPointer );
+            m_pLockedPointer = nullptr;
+            m_bPointerLocked = false;
+            m_bPointerLockRevoked = false;
 
-                zwp_relative_pointer_v1_destroy( m_pRelativePointer );
-                m_pRelativePointer = nullptr;
+            zwp_relative_pointer_v1_destroy( m_pRelativePointer );
+            m_pRelativePointer = nullptr;
 
-                m_pLockedSurface = nullptr;
-            }
-
-			if ( bRelative )
-			{
-				m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
-				zwp_locked_pointer_v1_add_listener( m_pLockedPointer, &s_LockedPointerListener, this );
-
-				m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
-
-				m_pLockedSurface = pSurface;
-			}
-
-            m_InputThread.SetRelativePointer( bRelative );
-
-            UpdateCursor();
+            m_pLockedSurface = nullptr;
         }
+
+        if ( bCreateLock )
+        {
+            m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
+            zwp_locked_pointer_v1_add_listener( m_pLockedPointer, &s_LockedPointerListener, this );
+
+            m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
+
+            m_pLockedSurface = pSurface;
+        }
+
+        m_InputThread.SetRelativePointer( bRelative );
+
+        UpdateCursor();
     }
 
     void CWaylandBackend::UpdateCursor()
@@ -2724,11 +2768,13 @@ namespace gamescope
 	void CWaylandBackend::Wayland_LockedPointer_Locked( zwp_locked_pointer_v1 *pLockedPointer )
 	{
 		m_bPointerLocked = true;
+		m_bPointerLockRevoked = false;
 		UpdateCursor();
 	}
 	void CWaylandBackend::Wayland_LockedPointer_Unlocked( zwp_locked_pointer_v1 *pLockedPointer )
 	{
 		m_bPointerLocked = false;
+		m_bPointerLockRevoked = true;
 		UpdateCursor();
 	}
 
@@ -2954,6 +3000,36 @@ namespace gamescope
         }
     }
 
+    bool CWaylandInputThread::IsRelativeMouseModeActive() const
+    {
+        // The relative pointer object outlives a lock the host took away again (KWin
+        // breaks pointer constraints when the focus changes), so the lock state has
+        // to be part of this, otherwise we would keep ignoring the only input we get.
+        return m_pRelativePointer.load() != nullptr &&
+            m_pBackend->m_bPointerLocked &&
+            ( cv_wayland_mouse_relmotion_without_keyboard_focus || m_bKeyboardEntered );
+    }
+
+    void CWaylandInputThread::ClearPendingRelativeMotion()
+    {
+        m_flPendingRelativeDX = 0.0;
+        m_flPendingRelativeDY = 0.0;
+        m_flPendingRelativeDXUnaccel = 0.0;
+        m_flPendingRelativeDYUnaccel = 0.0;
+        m_bHasPendingRelativeMotion = false;
+    }
+
+    void CWaylandInputThread::FlushPendingRelativeMotion()
+    {
+        // The caller submits the absolute motion right after this, so both events end
+        // up in the same pointer frame.
+        if ( !m_bHasPendingRelativeMotion )
+            return;
+
+        wlserver_forward_relative_motion( m_flPendingRelativeDX, m_flPendingRelativeDY, m_flPendingRelativeDXUnaccel, m_flPendingRelativeDYUnaccel );
+        ClearPendingRelativeMotion();
+    }
+
     void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed )
     {
         if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] )
@@ -3141,6 +3217,7 @@ namespace gamescope
 
 		m_pCurrentCursorSurface = nullptr;
 		m_bMouseEntered = false;
+		ClearPendingRelativeMotion();
 	}
 	void CWaylandInputThread::Wayland_Pointer_Motion( wl_pointer *pPointer, uint32_t uTime, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
 	{
@@ -3151,22 +3228,38 @@ namespace gamescope
 		CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( m_pCurrentCursorSurface );
 
 		if ( !pPlane )
+		{
+			ClearPendingRelativeMotion();
 			return;
+		}
 
-        if ( m_pRelativePointer.load() != nullptr )
+        // In relative mouse mode the host hands us the unclipped relative motion and
+        // we drive the cursor with that, so the absolute position is ignored. Only
+        // while the host actually honors the lock, though: if it revoked it, the
+        // absolute position is all that is left and dropping it would kill the mouse.
+        if ( IsRelativeMouseModeActive() )
+        {
+            // That path delivers the relative motion itself, so nothing collected
+            // here can still be pending.
+            ClearPendingRelativeMotion();
             return;
+        }
 
         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
         {
             // Don't do any motion/movement stuff if we don't have kb focus
             m_ofPendingCursorX = fSurfaceX;
             m_ofPendingCursorY = fSurfaceY;
+            ClearPendingRelativeMotion();
             return;
         }
 
 		auto oState = pPlane->GetCurrentState();
         if ( !oState )
+        {
+            ClearPendingRelativeMotion();
             return;
+        }
 
         uint32_t uScale = oState->uFractionalScale;
 
@@ -3174,6 +3267,7 @@ namespace gamescope
         double flY = ( wl_fixed_to_double( fSurfaceY ) * uScale / 120.0 + oState->nDestY ) / g_nOutputHeight;
 
         wlserver_lock();
+        FlushPendingRelativeMotion();
         wlserver_touchmotion( flX, flY, 0, ++m_uFakeTimestamp );
         wlserver_unlock();
     }
@@ -3352,7 +3446,7 @@ namespace gamescope
     void CWaylandInputThread::Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel )
     {
 		// Don't do any motion/movement stuff if we don't have kb focus
-		if ( !m_pBackend->m_bPointerLocked || ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered ) )
+		if ( !IsRelativeMouseModeActive() )
 			return;
 
         wlserver_lock();
@@ -3366,17 +3460,34 @@ namespace gamescope
         // own object; only step in when it is not doing that, or the deltas would
         // be counted twice. It is fed whether or not an application asked for a
         // locked pointer, so the pan effect gets raw, unclipped deltas either way.
-        const bool bRelativeModeTakesIt =
-            m_pRelativePointer.load() != nullptr &&
-            m_pBackend->m_bPointerLocked &&
-            ( cv_wayland_mouse_relmotion_without_keyboard_focus || m_bKeyboardEntered );
-
-        if ( bRelativeModeTakesIt )
+        if ( IsRelativeMouseModeActive() )
             return;
 
         wlserver_lock();
         wlserver_raw_relative_motion( wl_fixed_to_double( fDxUnaccel ), wl_fixed_to_double( fDyUnaccel ) );
         wlserver_unlock();
+
+        // The touch modes either send no pointer motion at all or turn the host
+        // position into relative motion of their own (wlserver_touchmotion ->
+        // wlserver_mousemotion), so handing these to the client as well would either
+        // do nothing or count every motion twice.
+        if ( !TouchClickModeDrivesPointer( m_pBackend->GetTouchClickMode() ) )
+            return;
+
+        // Without keyboard focus the absolute path does not deliver anything to the
+        // application either, so neither do we. The pan effect above does not care.
+        if ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered )
+            return;
+
+        if ( !cv_wayland_mouse_forward_relative_motion )
+            return;
+
+        // Hand them over with the next absolute motion, see FlushPendingRelativeMotion.
+        m_flPendingRelativeDX += wl_fixed_to_double( fDx );
+        m_flPendingRelativeDY += wl_fixed_to_double( fDy );
+        m_flPendingRelativeDXUnaccel += wl_fixed_to_double( fDxUnaccel );
+        m_flPendingRelativeDYUnaccel += wl_fixed_to_double( fDyUnaccel );
+        m_bHasPendingRelativeMotion = true;
     }
 
     /////////////////////////
