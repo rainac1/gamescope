@@ -24,17 +24,28 @@ namespace gamescope
         "Pan angle in degrees per accumulated mouse count. Default: 0.022" );
     ConVar<float> cv_pan_effect_focal( "pan_effect_focal", 720.0f,
         "Focal length in pixels used to project the pan angle onto the screen. Default: 720" );
+    ConVar<float> cv_pan_effect_pitch_limit( "pan_effect_pitch_limit", 89.0f,
+        "Engine pitch limit in degrees. The tracked pitch saturates here, the same way a game's own pitch clamp does, "
+        "which is also how it can be resynchronised by hand. Default: 89" );
     ConVar<bool> cv_pan_effect_invert( "pan_effect_invert", false,
         "Invert the pan direction." );
     static ConVar<bool> cv_pan_effect_debug( "pan_effect_debug", false,
-        "Print the accumulated pan counts and the resulting translation on every release. "
+        "Print the pan counts, the tracked pitch and the resulting translation on every press and release. "
         "A convar of its own because the gamescope_* environment variable override cannot raise a log channel." );
 
-    // Written and read under the wlserver lock, except for the reader on the
-    // steamcompmgr thread, which just wants the most recent value.
+    // Written and read under the wlserver lock, except for the readers on the
+    // steamcompmgr thread, which just want the most recent value.
     static std::atomic<bool> s_bPanKeyHeld{ false };
-    static std::atomic<double> s_flDeltaX{ 0.0 };
-    static std::atomic<double> s_flDeltaY{ 0.0 };
+    // Set once the held pan has moved, and kept until the key is released: the
+    // presentation layout follows this rather than the translation, which can come
+    // back to zero in the middle of a hold.
+    static std::atomic<bool> s_bPanEngaged{ false };
+    // Pan yaw, in accumulated mouse counts, only while the key is held.
+    static std::atomic<double> s_flPanYawCounts{ 0.0 };
+    // Engine pitch, in radians, tracked at all times.
+    static std::atomic<double> s_flPitchRad{ 0.0 };
+    // Engine pitch when the key went down, phi_0 in the projection.
+    static std::atomic<double> s_flPitchAtPressRad{ 0.0 };
 
     // A single event larger than this is a cursor jump (focus change, mode
     // switch), not pointer movement, so it is dropped.
@@ -134,26 +145,43 @@ namespace gamescope
         return s_PanKeysyms.contains( eKeysym );
     }
 
-    static void PanEffectComputeTranslationFromDeltas( double flDeltaX, double flDeltaY, double &flX, double &flY )
+    static void PanEffectComputeCurrentTranslation( double &flX, double &flY )
     {
         const double flRadiansPerCount = double( cv_pan_effect_angle.Get() ) * ( k_flPanEffectPi / 180.0 );
         const double flFocalPx = double( cv_pan_effect_focal.Get() );
         const double flSign = cv_pan_effect_invert.Get() ? -1.0 : 1.0;
 
-        flX = flSign * PanEffectComputeTranslation( flDeltaX, flRadiansPerCount, flFocalPx );
-        flY = flSign * PanEffectComputeTranslation( flDeltaY, flRadiansPerCount, flFocalPx );
+        const double flThetaX = s_flPanYawCounts.load( std::memory_order_relaxed ) * flRadiansPerCount;
+        const double flPhi0 = s_flPitchAtPressRad.load( std::memory_order_relaxed );
+        const double flPhi = s_flPitchRad.load( std::memory_order_relaxed );
+
+        PanEffectComputeTranslation( flThetaX, flPhi0, flPhi, flFocalPx, flX, flY );
+        flX *= flSign;
+        flY *= flSign;
+    }
+
+    static double PanEffectGetPitchLimitRad()
+    {
+        return double( cv_pan_effect_pitch_limit.Get() ) * ( k_flPanEffectPi / 180.0 );
     }
 
     static bool PanEffectIsActive()
     {
-        return cv_pan_effect_enabled.Get() && s_bPanKeyHeld.load( std::memory_order_relaxed );
+        // s_bPanEngaged is what drives the presentation layout: it goes true as soon as
+        // the held pan moves and stays true until the key is released, even if the
+        // translation comes back to zero in between.
+        return cv_pan_effect_enabled.Get() &&
+            s_bPanKeyHeld.load( std::memory_order_relaxed ) &&
+            s_bPanEngaged.load( std::memory_order_relaxed );
     }
 
     void PanEffectReset()
     {
         s_bPanKeyHeld.store( false, std::memory_order_relaxed );
-        s_flDeltaX.store( 0.0, std::memory_order_relaxed );
-        s_flDeltaY.store( 0.0, std::memory_order_relaxed );
+        s_bPanEngaged.store( false, std::memory_order_relaxed );
+        s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
+        // The tracked pitch is deliberately left alone: it mirrors the game's camera,
+        // which does not recentre just because the session paused.
     }
 
     void PanEffectObserveKey( xkb_keysym_t eKeysym, bool bPressed )
@@ -174,10 +202,14 @@ namespace gamescope
         {
             if ( !s_bPanKeyHeld.exchange( true, std::memory_order_relaxed ) )
             {
-                // A fresh hold always starts from the centre again.
-                s_flDeltaX.store( 0.0, std::memory_order_relaxed );
-                s_flDeltaY.store( 0.0, std::memory_order_relaxed );
-                s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG, "Pan hold started." );
+                // A fresh hold starts from the centre again, relative to the pitch the
+                // engine (the game's camera) is at right now.
+                s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
+                s_bPanEngaged.store( false, std::memory_order_relaxed );
+                s_flPitchAtPressRad.store( s_flPitchRad.load( std::memory_order_relaxed ), std::memory_order_relaxed );
+                s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
+                    std::format( "Pan hold started at pitch {:.1f} deg.",
+                        s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi ) );
             }
             return;
         }
@@ -186,46 +218,52 @@ namespace gamescope
         {
             // Log the numbers so the angle/focal length can be tuned against a
             // known mouse movement instead of guessing.
-            const double flDeltaX = s_flDeltaX.load( std::memory_order_relaxed );
-            const double flDeltaY = s_flDeltaY.load( std::memory_order_relaxed );
+            const double flYawCounts = s_flPanYawCounts.load( std::memory_order_relaxed );
+            const double flPitchDeg = s_flPitchRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
+            const double flPitchAtPressDeg = s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
             double flX = 0.0, flY = 0.0;
-            PanEffectComputeTranslationFromDeltas( flDeltaX, flDeltaY, flX, flY );
+            PanEffectComputeCurrentTranslation( flX, flY );
 
             s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
                 std::format(
-                    "Pan hold released, recentring. accum=({:.1f}, {:.1f}) counts -> trans=({:.1f}, {:.1f}) px "
-                    "(angle={:.4f} deg/count, focal={:.1f} px, gain={:.4f} px/count before tan)",
-                    flDeltaX, flDeltaY, flX, flY,
-                    double( cv_pan_effect_angle.Get() ), double( cv_pan_effect_focal.Get() ),
-                    double( cv_pan_effect_focal.Get() ) * double( cv_pan_effect_angle.Get() ) * ( k_flPanEffectPi / 180.0 ) ) );
+                    "Pan hold released, recentring. yaw={:.1f} counts -> trans=({:.1f}, {:.1f}) px "
+                    "(pitch {:.1f} -> {:.1f} deg, angle={:.4f} deg/count, focal={:.1f} px)",
+                    flYawCounts, flX, flY, flPitchAtPressDeg, flPitchDeg,
+                    double( cv_pan_effect_angle.Get() ), double( cv_pan_effect_focal.Get() ) ) );
         }
 
-        s_flDeltaX.store( 0.0, std::memory_order_relaxed );
-        s_flDeltaY.store( 0.0, std::memory_order_relaxed );
-    }
-
-    // Called with the wlserver lock held.
-    static void PanEffectAccumulateDelta( double flDx, double flDy )
-    {
-        if ( !s_bPanKeyHeld.load( std::memory_order_relaxed ) )
-            return;
-
-        if ( std::abs( flDx ) > k_flPanEffectMaxStep || std::abs( flDy ) > k_flPanEffectMaxStep )
-            return;
-
-        // Every writer is serialised by the wlserver lock, so a relaxed
-        // read-modify-write cannot lose an update.
-        s_flDeltaX.store( s_flDeltaX.load( std::memory_order_relaxed ) + flDx, std::memory_order_relaxed );
-        s_flDeltaY.store( s_flDeltaY.load( std::memory_order_relaxed ) + flDy, std::memory_order_relaxed );
+        s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
+        s_bPanEngaged.store( false, std::memory_order_relaxed );
     }
 
     bool PanEffectAccumulateMotion( double flDx, double flDy )
     {
+        if ( !cv_pan_effect_enabled.Get() )
+            return false;
+
+        // A single event larger than this is a cursor jump (focus change, mode
+        // switch), not pointer movement, so it is dropped.
+        if ( std::abs( flDx ) > k_flPanEffectMaxStep || std::abs( flDy ) > k_flPanEffectMaxStep )
+            return false;
+
+        const double flRadiansPerCount = double( cv_pan_effect_angle.Get() ) * ( k_flPanEffectPi / 180.0 );
+
+        // The engine pitch follows y motion at all times, held or not, so that the
+        // pitch the pan is relative to is where the game's camera actually is. Only
+        // the input thread writes it, under the wlserver lock.
+        s_flPitchRad.store(
+            PanEffectTrackPitch( s_flPitchRad.load( std::memory_order_relaxed ), flDy * flRadiansPerCount, PanEffectGetPitchLimitRad() ),
+            std::memory_order_relaxed );
+
         if ( !s_bPanKeyHeld.load( std::memory_order_relaxed ) )
             return false;
 
-        PanEffectAccumulateDelta( flDx, flDy );
-        return true;
+        // The pan yaw accumulates while the key is held. The pan pitch is the tracked
+        // pitch itself, so the y motion is not accumulated a second time.
+        s_flPanYawCounts.store( s_flPanYawCounts.load( std::memory_order_relaxed ) + flDx, std::memory_order_relaxed );
+        s_bPanEngaged.store( true, std::memory_order_relaxed );
+
+        return flDx != 0.0 || flDy != 0.0;
     }
 
     bool PanEffectGetTranslation( double &flX, double &flY )
@@ -236,12 +274,7 @@ namespace gamescope
         if ( !PanEffectIsActive() )
             return false;
 
-        const double flDeltaX = s_flDeltaX.load( std::memory_order_relaxed );
-        const double flDeltaY = s_flDeltaY.load( std::memory_order_relaxed );
-        if ( flDeltaX == 0.0 && flDeltaY == 0.0 )
-            return false;
-
-        PanEffectComputeTranslationFromDeltas( flDeltaX, flDeltaY, flX, flY );
+        PanEffectComputeCurrentTranslation( flX, flY );
         return true;
     }
 
@@ -258,22 +291,22 @@ namespace gamescope
         }
     }
 
-    void PanEffectLimitTranslation( double flMinX, double flMaxX, double flMinY, double flMaxY )
+    void PanEffectLimitTranslation( double flMinX, double flMaxX )
     {
         const double flRadiansPerCount = double( cv_pan_effect_angle.Get() ) * ( k_flPanEffectPi / 180.0 );
         const double flFocalPx = double( cv_pan_effect_focal.Get() );
+        if ( flRadiansPerCount <= 0.0 || flFocalPx <= 0.0 )
+            return;
 
-        // The translation is the (possibly inverted) projection of the accumulated
-        // counts, so flip the bounds back to get the counts that may still be
-        // accumulated. The projection is monotone, so clamping the counts clamps the
-        // translation.
+        // Both bounds are inverted on their own side, since the projection is not
+        // symmetric once the invert convar is in play.
         const double flSign = cv_pan_effect_invert.Get() ? -1.0 : 1.0;
-        const double flCountsAX = flSign * PanEffectCountsForTranslation( flMinX, flRadiansPerCount, flFocalPx );
-        const double flCountsBX = flSign * PanEffectCountsForTranslation( flMaxX, flRadiansPerCount, flFocalPx );
-        const double flCountsAY = flSign * PanEffectCountsForTranslation( flMinY, flRadiansPerCount, flFocalPx );
-        const double flCountsBY = flSign * PanEffectCountsForTranslation( flMaxY, flRadiansPerCount, flFocalPx );
+        const double flPhi0 = s_flPitchAtPressRad.load( std::memory_order_relaxed );
+        const double flPhi = s_flPitchRad.load( std::memory_order_relaxed );
 
-        PanEffectClampDelta( s_flDeltaX, std::min( flCountsAX, flCountsBX ), std::max( flCountsAX, flCountsBX ) );
-        PanEffectClampDelta( s_flDeltaY, std::min( flCountsAY, flCountsBY ), std::max( flCountsAY, flCountsBY ) );
+        const double flYawMax = PanEffectYawLimitForBound( flMinX, flMaxX, flPhi0, flPhi, flFocalPx, flSign, true );
+        const double flYawMin = -PanEffectYawLimitForBound( flMinX, flMaxX, flPhi0, flPhi, flFocalPx, flSign, false );
+
+        PanEffectClampDelta( s_flPanYawCounts, flYawMin / flRadiansPerCount, flYawMax / flRadiansPerCount );
     }
 }

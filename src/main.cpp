@@ -78,6 +78,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "pan-effect-key", required_argument, nullptr, 0 },
 	{ "pan-effect-angle", required_argument, nullptr, 0 },
 	{ "pan-effect-focal", required_argument, nullptr, 0 },
+	{ "pan-effect-pitch-limit", required_argument, nullptr, 0 },
 	{ "pan-effect-invert", no_argument, nullptr, 0 },
 	{ "pan-effect-disable", no_argument, nullptr, 0 },
 	{ "mangoapp", no_argument, nullptr, 0 },
@@ -192,6 +193,7 @@ const char usage[] =
 	"  --pan-effect-key               key that drives the screen pan effect while held (xkb keysym name, default: Alt)\n"
 	"  --pan-effect-angle             pan angle in degrees per accumulated mouse count, default: 0.022\n"
 	"  --pan-effect-focal             focal length in pixels used to project the pan angle, default: 720\n"
+	"  --pan-effect-pitch-limit       engine pitch limit in degrees, default: 89\n"
 	"  --pan-effect-invert            invert the pan direction\n"
 	"  --pan-effect-disable           disable the screen pan effect\n"
 	"  --backend                      select rendering backend\n"
@@ -876,6 +878,8 @@ int main(int argc, char **argv)
 					gamescope::cv_pan_effect_angle = parse_float( optarg, opt_name );
 				} else if (strcmp(opt_name, "pan-effect-focal") == 0) {
 					gamescope::cv_pan_effect_focal = parse_float( optarg, opt_name );
+				} else if (strcmp(opt_name, "pan-effect-pitch-limit") == 0) {
+					gamescope::cv_pan_effect_pitch_limit = parse_float( optarg, opt_name );
 				} else if (strcmp(opt_name, "pan-effect-invert") == 0) {
 					gamescope::cv_pan_effect_invert = true;
 				} else if (strcmp(opt_name, "pan-effect-disable") == 0) {

@@ -81,30 +81,56 @@ See `gamescope --help` for a full list of options.
 
 ## Screen pan effect
 
-Hold `Alt` (configurable) while playing and the relative mouse motion is
-accumulated into `(delta_x, delta_y)` counts. While the key is held, the game's
-frame is translated in output pixels right before it is presented to the
-display:
+The engine pitch is tracked at all times: every y mouse movement, pan key held or
+not, moves `phi_pitch`, and it saturates at `--pan-effect-pitch-limit`
+(`pan_effect_pitch_limit`, 89 degrees by default) the same way a game's own pitch
+clamp does.
+
+While the pan key is held, mouse motion accumulates into `(delta_x, delta_y)`
+counts and the game's frame is translated in output pixels right before it is
+presented, relative to the pitch the engine was at when the key went down
+(`phi_0`):
 
 ```
-theta_x = k * delta_x
-theta_y = k * delta_y
-trans_X = f * tan(theta_x)
-trans_Y = f * tan(theta_y)
+theta_x = k * delta_x              (pan yaw, accumulated while the key is held)
+theta_y = k * delta_y              (pan pitch, accumulated while the key is held)
+phi     = phi_0 + theta_y          (engine pitch now)
+
+         sin(theta_x) / cos(phi)
+dX = f * ---------------------------------------------
+         cos(theta_x) + tan(phi_0) * tan(phi)
+
+         tan(phi) * cos(theta_x) - tan(phi_0)
+dY = f * ---------------------------------------
+         cos(theta_x) + tan(phi_0) * tan(phi)
 ```
+
+The projection has a pole where that denominator vanishes (the two pitches small
+and of opposite sign, yaw out towards 90 degrees). The yaw is held on the near
+side of it, so the translation stays finite and does not flip sign.
 
 Pixels pushed outside of the output are cropped and the vacated space is left
 black. Releasing the key clears the accumulated motion, so the picture returns
-to where it was.
+to where it was. The tracked pitch is of course not cleared: it is where the
+game's camera is looking.
 
 * `k` is `--pan-effect-angle` / `pan_effect_angle`, in degrees per mouse count, `0.022` by default.
 * `f` is `--pan-effect-focal` / `pan_effect_focal`, in pixels, `720` by default.
+* The engine pitch limit is `--pan-effect-pitch-limit` / `pan_effect_pitch_limit`, in degrees, `89` by default.
 * The key is `--pan-effect-key` / `pan_effect_key`: an xkb keysym name or a comma separated list. `Alt`, `Super`, `Shift`, `Control`, `Meta` and `Hyper` expand to both the left and right variants, and `Ctrl`/`Win` are accepted as aliases.
-* A positive `delta_x` shifts the picture right and a positive `delta_y` shifts it down. Use `--pan-effect-invert` / `pan_effect_invert` for the opposite direction.
+* A positive `delta_x` yaws the world right and a positive `delta_y` pitches it down. Use `--pan-effect-invert` / `pan_effect_invert` for the opposite direction.
 * `--pan-effect-disable` or `pan_effect_enabled=0` turns the effect off.
-* `pan_effect_debug=1` (no command line flag) prints the accumulated counts and
-  the resulting translation on every release, which is the easiest way to
-  calibrate `k` and `f`.
+* `pan_effect_debug=1` (no command line flag) prints the pan counts, the pitch
+  before and after the hold, and the resulting translation on every press and
+  release, which is the easiest way to calibrate `k` and `f`.
+
+### Calibrating the tracked pitch
+
+The tracked pitch is an estimate of where the game's camera is pointed, so it
+starts out unknown. It is resynchronised by hand, which the pitch limit makes
+exact: look all the way down and keep pulling the mouse down until the pitch
+saturates, which pins it to the limit (looking all the way up pins it to minus
+the limit). Do that before panning and the projection has a known `phi_0`.
 
 ### Pixel exactness
 
@@ -166,7 +192,8 @@ unchanged.
 All of the options above are ordinary convars, reachable three ways:
 
 * Command line, for the ones with a flag: `--pan-effect-key`, `--pan-effect-angle`,
-  `--pan-effect-focal`, `--pan-effect-invert`, `--pan-effect-disable`.
+  `--pan-effect-focal`, `--pan-effect-pitch-limit`, `--pan-effect-invert`,
+  `--pan-effect-disable`.
 * Environment variables, `gamescope_<convar>=<value>`. Booleans and numbers work
   as written (`gamescope_pan_effect_focal=2160`). **String values have to be
   quoted**, because the override is pasted into Lua verbatim:
@@ -179,13 +206,15 @@ All of the options above are ordinary convars, reachable three ways:
   variables cannot do that, as they assign the value without running the
   callback.
 
-While tuning, a good workflow is to hold the key and move the mouse a fixed
-distance on the pad, then read the numbers back:
+While tuning, a good workflow is to resynchronise the pitch first (see above),
+then hold the key and move the mouse a fixed distance on the pad, and read the
+numbers back:
 
 ```
 $ gamescope_pan_effect_debug=true gamescope -- glxgears
-[pan_effect] Pan hold released, recentring. accum=(812.0, 3.0) counts -> trans=(224.6, 0.8) px
-             (angle=0.0220 deg/count, focal=720.0 px, gain=0.2765 px/count before tan)
+[pan_effect] Pan hold started at pitch -89.0 deg.
+[pan_effect] Pan hold released, recentring. yaw=812.0 counts -> trans=(60.1, 0.2) px
+             (pitch -89.0 -> -89.0 deg, angle=0.0220 deg/count, focal=720.0 px)
 ```
 
 `gain` is the small angle `f * k` in px/count. Raising `f` scales the shift

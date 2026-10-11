@@ -3526,10 +3526,11 @@ paint_all( global_focus_t *pFocus, bool async )
 				flMinY = std::max( 1.0 - double( baseLayer.integerHeight() ), -flMaxPanY );
 				flMaxY = std::min( double( g_nOutputHeight ) - 1.0, flMaxPanY );
 
-				// Stop accumulating motion that is already at a bound, so that holding
+				// Stop accumulating yaw that is already at a bound, so that holding
 				// the mouse against it does not build up motion that has to be undone
-				// before the picture starts moving back again.
-				gamescope::PanEffectLimitTranslation( flMinX, flMaxX, flMinY, flMaxY );
+				// before the picture starts moving back again. The pitch is tracked
+				// rather than accumulated for the pan, so it has no equivalent.
+				gamescope::PanEffectLimitTranslation( flMinX, flMaxX );
 
 				flPanX = std::clamp( flPanX, flMinX, flMaxX );
 				flPanY = std::clamp( flPanY, flMinY, flMaxY );
