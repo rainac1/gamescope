@@ -1,3 +1,12 @@
 glm-*
+glm
 packagecache
 stb
+.wraplock
+
+# Meson writes these dummy [wrap-redirect] files when a wrap comes from inside one
+# of the submodules (wlroots' libdisplay-info and libliftoff, libdisplay-info's
+# v4l-utils), so that later runs find it in the main project too.
+libdisplay-info.wrap
+libliftoff.wrap
+v4l-utils.wrap
