@@ -298,14 +298,16 @@ namespace gamescope
         if ( flRadiansPerCount <= 0.0 || flFocalPx <= 0.0 )
             return;
 
-        // Both bounds are inverted on their own side, since the projection is not
-        // symmetric once the invert convar is in play.
+        // Truncate the accumulated yaw at the yaw that reaches each bound. The invert
+        // convar is applied to the projection, so each bound is inverted on its own
+        // side before it is asked what yaw it takes. The pitch is tracked rather than
+        // accumulated for the pan, so it needs no equivalent.
         const double flSign = cv_pan_effect_invert.Get() ? -1.0 : 1.0;
         const double flPhi0 = s_flPitchAtPressRad.load( std::memory_order_relaxed );
         const double flPhi = s_flPitchRad.load( std::memory_order_relaxed );
 
-        const double flYawMax = PanEffectYawLimitForBound( flMinX, flMaxX, flPhi0, flPhi, flFocalPx, flSign, true );
-        const double flYawMin = -PanEffectYawLimitForBound( flMinX, flMaxX, flPhi0, flPhi, flFocalPx, flSign, false );
+        const double flYawMax = PanEffectYawForTranslation( flSign * flMaxX, flPhi0, flPhi, flFocalPx );
+        const double flYawMin = -PanEffectYawForTranslation( -flSign * flMinX, flPhi0, flPhi, flFocalPx );
 
         PanEffectClampDelta( s_flPanYawCounts, flYawMin / flRadiansPerCount, flYawMax / flRadiansPerCount );
     }

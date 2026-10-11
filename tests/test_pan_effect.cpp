@@ -113,9 +113,12 @@ TEST_CASE("PanEffectTrackPitch", "[pan_effect]") {
 	REQUIRE(PanEffectTrackPitch(1.0, 0.0, 0.0) == 0.0);
 }
 
-TEST_CASE("PanEffectYawLimitForBound", "[pan_effect]") {
+TEST_CASE("PanEffectYawForTranslation", "[pan_effect]") {
 	const double flFocal = 720.0;
+	const double flBound = 640.0;
 
+	// The inverse lands on the requested translation wherever the projection can reach
+	// it, which is everywhere within the bounds in practice.
 	for (double flPhi0Deg : { 0.0, 30.0, -45.0, 70.0 })
 	{
 		for (double flPhiDeg : { 0.0, 25.0, -50.0, 80.0 })
@@ -124,42 +127,56 @@ TEST_CASE("PanEffectYawLimitForBound", "[pan_effect]") {
 			const double flPhi = flPhiDeg * k_flDegToRad;
 			const double flMaxYaw = PanEffectMaxYawForPitch(flPhi0, flPhi);
 
-			for (double flBound : { 100.0, 640.0 })
+			// With the two pitches equal the projection is f * tan(yaw) / ... and the
+			// translation therefore very reachable; with them far apart it may not be.
+			const auto [flReach, flReachY] = Project(flMaxYaw, flPhi0, flPhi, flFocal);
+
+			const double flYaw = PanEffectYawForTranslation(flBound, flPhi0, flPhi, flFocal);
+			REQUIRE(flYaw >= 0.0);
+			REQUIRE(flYaw <= flMaxYaw + 1e-9);
+
+			const auto [flX, flY] = Project(flYaw, flPhi0, flPhi, flFocal);
+			if (flReach < 0.0)
 			{
-				const double flYawMax = PanEffectYawLimitForBound(-flBound, flBound, flPhi0, flPhi, flFocal, 1.0, true);
-				const double flYawMin = -PanEffectYawLimitForBound(-flBound, flBound, flPhi0, flPhi, flFocal, 1.0, false);
-
-				REQUIRE(flYawMax >= 0.0);
-				REQUIRE(flYawMin <= 0.0);
-				REQUIRE(flYawMax <= flMaxYaw + 1e-9);
-				REQUIRE(-flYawMin <= flMaxYaw + 1e-9);
-
-				// The point of the search: at the limit the translation is still inside
-				// the bounds. (Beyond it the projection is not guaranteed to keep
-				// growing, so that is all that can be promised.)
-				const auto [flXMax, flYMax] = Project(flYawMax, flPhi0, flPhi, flFocal);
-				const auto [flXMin, flYMin] = Project(flYawMin, flPhi0, flPhi, flFocal);
-				REQUIRE(flXMax <= flBound + 1e-6);
-				REQUIRE(flXMin >= -flBound - 1e-6);
+				// Denominator negative: the tracked point is behind the camera, the
+				// projection has no meaning, nothing accumulates.
+				REQUIRE(flYaw == 0.0);
+			}
+			else if (flReach >= flBound)
+			{
+				REQUIRE(std::abs(flX - flBound) < 1e-6);
+			}
+			else
+			{
+				// Valid but out of reach: the whole yaw range is allowed.
+				REQUIRE(flYaw == Catch::Approx(flMaxYaw));
 			}
 		}
 	}
 
-	// The invert convar is applied before the bounds, so both sides stay bounded.
+	// Nonsense input cannot produce a yaw.
+	REQUIRE(PanEffectYawForTranslation(0.0, 0.0, 0.0, flFocal) == 0.0);
+	REQUIRE(PanEffectYawForTranslation(-10.0, 0.0, 0.0, flFocal) == 0.0);
+	REQUIRE(PanEffectYawForTranslation(100.0, 0.0, 0.0, 0.0) == 0.0);
+
+	// Where the pitch pair puts the tracked point behind the camera the denominator is
+	// negative and the projection has no meaning, so nothing accumulates.
 	{
-		const double flPhi0 = 20.0 * k_flDegToRad;
-		const double flPhi = -10.0 * k_flDegToRad;
-		const double flYawMax = PanEffectYawLimitForBound(-200.0, 200.0, flPhi0, flPhi, flFocal, -1.0, true);
-		const auto [flX, flY] = Project(flYawMax, flPhi0, flPhi, flFocal);
-		REQUIRE(-flX >= -200.0);
-		REQUIRE(-flX <= 200.0);
+		const double flPhi0 = 89.0 * k_flDegToRad;
+		const double flPhi = -2.0 * k_flDegToRad;
+		REQUIRE(PanEffectYawForTranslation(flBound, flPhi0, flPhi, flFocal) == 0.0);
+		REQUIRE(PanEffectYawForTranslation(1.0, flPhi0, flPhi, flFocal) == 0.0);
 	}
 
-	// A bound that no yaw can satisfy leaves nothing to accumulate, and a bound that
-	// every yaw satisfies does not limit at all.
-	REQUIRE(PanEffectYawLimitForBound(-20.0, -10.0, 0.0, 0.0, flFocal, 1.0, true) == 0.0);
-	REQUIRE(PanEffectYawLimitForBound(-1e9, 1e9, 0.0, 0.0, flFocal, 1.0, true) ==
-	        Catch::Approx(PanEffectMaxYawForPitch(0.0, 0.0)));
+	// Sanity: the reachable range the caller clamps to really is in bounds.
+	{
+		const double flPhi0 = 60.0 * k_flDegToRad;
+		const double flPhi = -30.0 * k_flDegToRad;
+		const double flYaw = PanEffectYawForTranslation(flBound, flPhi0, flPhi, flFocal);
+		const auto [flX, flY] = Project(flYaw, flPhi0, flPhi, flFocal);
+		REQUIRE(flX <= flBound + 1e-6);
+		REQUIRE(flX >= 0.0);
+	}
 }
 
 TEST_CASE("PanEffectMaxYawForPitch", "[pan_effect]") {

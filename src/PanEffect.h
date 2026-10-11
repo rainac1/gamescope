@@ -107,47 +107,39 @@ namespace gamescope
         return std::clamp( flPitchRad + flDeltaRad, -flLimit, flLimit );
     }
 
-    // The largest yaw magnitude on one side whose projected translation, after the
-    // invert convar (flSign), still lies within [flMinX, flMaxX]. Walks outwards and
-    // then bisects, rather than root finding, because the projection is not
-    // guaranteed to be monotone once the pan pitch has travelled far. Only used to
-    // stop accumulating yaw that is already past what can be shown, so a coarse
-    // answer is fine.
-    inline double PanEffectYawLimitForBound( double flMinX, double flMaxX, double flPhi0, double flPhi, double flFocalPx, double flSign, bool bPositiveYaw )
+    // The pan yaw that projects to flTranslationPx: the direct inverse of
+    // PanEffectComputeTranslation, no search. Writing the projection as
+    //
+    //     flTranslationPx * cos(phi) * cos(theta) - f * sin(theta)
+    //         == -flTranslationPx * sin(phi) * tan(phi_0)
+    //
+    // makes it a * cos(theta) + b * sin(theta) == c, so the yaw is
+    // atan2(b, a) + acos(c / hypot(a, b)). The projection is odd in the yaw, so
+    // flTranslationPx must be positive.
+    //
+    // Returns 0 when the projection cannot reach the target for a yaw on that side,
+    // which includes the pitch pairs whose denominator comes out negative (the tracked
+    // point has gone behind the camera, so the projection has no meaning there): the
+    // pan then simply does not move. Only used to stop accumulating yaw that is
+    // already past what can be shown.
+    inline double PanEffectYawForTranslation( double flTranslationPx, double flPhi0, double flPhi, double flFocalPx )
     {
-        const double flMaxYaw = PanEffectMaxYawForPitch( flPhi0, flPhi );
-        const int nSamples = 64;
+        if ( flFocalPx <= 0.0 || flTranslationPx <= 0.0 )
+            return 0.0;
 
-        auto bInBounds = [&]( double flMagnitude ) -> bool
-        {
-            double flX = 0.0, flY = 0.0;
-            PanEffectComputeTranslation( bPositiveYaw ? flMagnitude : -flMagnitude, flPhi0, flPhi, flFocalPx, flX, flY );
-            const double flFinalX = flSign * flX;
-            return std::isfinite( flFinalX ) && flFinalX >= flMinX && flFinalX <= flMaxX;
-        };
+        const double flClampedPhi0 = std::clamp( flPhi0, -k_flPanEffectMaxPitch, k_flPanEffectMaxPitch );
+        const double flClampedPhi = std::clamp( flPhi, -k_flPanEffectMaxPitch, k_flPanEffectMaxPitch );
 
-        double flLastGood = 0.0;
-        for ( int i = 1; i <= nSamples; i++ )
-        {
-            const double flYaw = flMaxYaw * double( i ) / double( nSamples );
-            if ( !bInBounds( flYaw ) )
-            {
-                double flLow = flLastGood, flHigh = flYaw;
-                for ( int j = 0; j < 24; j++ )
-                {
-                    const double flMid = 0.5 * ( flLow + flHigh );
-                    if ( bInBounds( flMid ) )
-                        flLow = flMid;
-                    else
-                        flHigh = flMid;
-                }
-                return flLow;
-            }
+        const double flA = flTranslationPx * std::cos( flClampedPhi );
+        const double flB = -flFocalPx;
+        const double flC = -flTranslationPx * std::sin( flClampedPhi ) * std::tan( flClampedPhi0 );
 
-            flLastGood = flYaw;
-        }
+        const double flR = std::hypot( flA, flB );
+        if ( flR <= 0.0 )
+            return 0.0;
 
-        return flLastGood;
+        const double flYaw = std::atan2( flB, flA ) + std::acos( std::clamp( flC / flR, -1.0, 1.0 ) );
+        return std::clamp( flYaw, 0.0, PanEffectMaxYawForPitch( flClampedPhi0, flClampedPhi ) );
     }
 
     // Snap a translation in output pixels to whole source texels, so that the
