@@ -2,11 +2,14 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <format>
 #include <mutex>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
+#include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "log.hpp"
@@ -18,8 +21,9 @@ namespace gamescope
 
     ConVar<bool> cv_pan_effect_enabled( "pan_effect_enabled", true,
         "Enable the screen pan effect. Hold pan_effect_key and move the mouse to shift the game's frame." );
-    ConVar<std::string> cv_pan_effect_key( "pan_effect_key", "Alt",
-        "xkb keysym name, or a comma separated list of them, that drives the screen pan effect while held. Default: Alt" );
+    ConVar<std::string> cv_pan_effect_key( "pan_effect_key", "BTN_RIGHT",
+        "xkb keysym name, or a mouse button name (BTN_RIGHT, BTN_SIDE, Mouse4, ...), or a comma separated list of "
+        "them, that drives the screen pan effect while held. Default: BTN_RIGHT" );
     ConVar<float> cv_pan_effect_angle( "pan_effect_angle", 0.022f,
         "Pan angle in degrees per accumulated mouse count. Default: 0.022" );
     ConVar<float> cv_pan_effect_focal( "pan_effect_focal", 720.0f,
@@ -35,25 +39,29 @@ namespace gamescope
 
     // Written and read under the wlserver lock, except for the readers on the
     // steamcompmgr thread, which just want the most recent value.
-    static std::atomic<bool> s_bPanKeyHeld{ false };
-    // Set once the held pan has moved, and kept until the key is released: the
-    // presentation layout follows this rather than the translation, which can come
-    // back to zero in the middle of a hold.
+    static std::atomic<bool> s_bPanTriggerHeld{ false };
+    // Set once the held pan has moved, and kept until every trigger is released:
+    // the presentation layout follows this rather than the translation, which can
+    // come back to zero in the middle of a hold.
     static std::atomic<bool> s_bPanEngaged{ false };
-    // Pan yaw, in accumulated mouse counts, only while the key is held.
+    // Pan yaw, in accumulated mouse counts, only while a trigger is held.
     static std::atomic<double> s_flPanYawCounts{ 0.0 };
     // Engine pitch, in radians, tracked at all times.
     static std::atomic<double> s_flPitchRad{ 0.0 };
-    // Engine pitch when the key went down, phi_0 in the projection.
+    // Engine pitch when the trigger went down, phi_0 in the projection.
     static std::atomic<double> s_flPitchAtPressRad{ 0.0 };
 
     // A single event larger than this is a cursor jump (focus change, mode
     // switch), not pointer movement, so it is dropped.
     static constexpr double k_flPanEffectMaxStep = 4096.0;
 
-    static std::mutex s_KeyMutex;
-    static std::unordered_set<xkb_keysym_t> s_PanKeysyms;
-    static std::string s_CachedKeyConfig;
+    // The configured triggers, and the ones currently held (their Packed() ids).
+    // Both under s_TriggerMutex, which lets the convar be changed from another
+    // thread while the input path is pressing and releasing.
+    static std::mutex s_TriggerMutex;
+    static std::unordered_set<uint64_t> s_PanTriggers;
+    static std::unordered_set<uint64_t> s_HeldTriggers;
+    static std::string s_CachedTriggerConfig;
 
     static xkb_keysym_t PanEffectResolveKeysym( std::string_view svKey )
     {
@@ -75,20 +83,108 @@ namespace gamescope
         return svKey;
     }
 
-    // Add one configured key name. "Alt" and friends have no keysym of their
-    // own, so they expand to the left/right pair.
-    static bool PanEffectAddKey( std::string_view svKey )
+    static std::string PanEffectToLower( std::string_view svText )
     {
+        std::string sLower{ svText };
+        for ( char &c : sLower )
+            c = char( std::tolower( (unsigned char) c ) );
+        return sLower;
+    }
+
+    // The mouse buttons a pan trigger can name, with the friendly spellings for
+    // them. The codes are the Linux input codes the backends deliver.
+    static constexpr std::pair<std::string_view, uint32_t> k_pPanEffectButtons[] =
+    {
+        { "btn_left",     BTN_LEFT },
+        { "btn_right",    BTN_RIGHT },
+        { "btn_middle",   BTN_MIDDLE },
+        { "btn_side",     BTN_SIDE },
+        { "btn_extra",    BTN_EXTRA },
+        { "btn_forward",  BTN_FORWARD },
+        { "btn_back",     BTN_BACK },
+        { "btn_task",     BTN_TASK },
+        { "mouseleft",    BTN_LEFT },
+        { "mouseright",   BTN_RIGHT },
+        { "mousemiddle",  BTN_MIDDLE },
+        { "mouseside",    BTN_SIDE },
+        { "mouseextra",   BTN_EXTRA },
+        { "mouseforward", BTN_FORWARD },
+        { "mouseback",    BTN_BACK },
+        { "mousetask",    BTN_TASK },
+        // The numbered spellings follow X11: 1/2/3 are left/middle/right, and
+        // 4..8 are the extra buttons in the order they are named above.
+        { "mouse1",       BTN_LEFT },
+        { "mouse2",       BTN_MIDDLE },
+        { "mouse3",       BTN_RIGHT },
+        { "mouse4",       BTN_SIDE },
+        { "mouse5",       BTN_EXTRA },
+        { "mouse6",       BTN_FORWARD },
+        { "mouse7",       BTN_BACK },
+        { "mouse8",       BTN_TASK },
+    };
+
+    // "button:275" or "button:0x113": an escape hatch for buttons that are not
+    // named above, eg. on a device with more of them.
+    static bool PanEffectResolveRawButton( std::string_view svName, uint32_t &uButton )
+    {
+        constexpr std::string_view svPrefix = "button:";
+        if ( svName.size() <= svPrefix.size() ||
+             PanEffectToLower( svName.substr( 0, svPrefix.size() ) ) != svPrefix )
+            return false;
+
+        const std::string sNumber{ svName.substr( svPrefix.size() ) };
+        if ( sNumber.empty() || !std::isdigit( (unsigned char) sNumber[0] ) )
+            return false;
+
+        char *pszEnd = nullptr;
+        const unsigned long ulCode = std::strtoul( sNumber.c_str(), &pszEnd, 0 );
+        if ( pszEnd == sNumber.c_str() || *pszEnd != '\0' )
+            return false;
+
+        uButton = uint32_t( ulCode );
+        return true;
+    }
+
+    static bool PanEffectResolveButton( std::string_view svName, uint32_t &uButton )
+    {
+        const std::string sLower = PanEffectToLower( svName );
+
+        for ( const auto &[svButtonName, uCode] : k_pPanEffectButtons )
+        {
+            if ( sLower == svButtonName )
+            {
+                uButton = uCode;
+                return true;
+            }
+        }
+
+        return PanEffectResolveRawButton( sLower, uButton );
+    }
+
+    // Add one configured name to vTriggers. A mouse button is tried first: none of
+    // its names is a keysym, and it keeps "mouse4" from being read as anything
+    // else. "Alt" and friends have no keysym of their own, so they expand to the
+    // left/right pair.
+    static bool PanEffectAddTrigger( std::vector<PanEffectTrigger> &vTriggers, std::string_view svName )
+    {
+        uint32_t uButton = 0;
+        if ( PanEffectResolveButton( svName, uButton ) )
+        {
+            vTriggers.push_back( { PanEffectTrigger::Kind::Button, uButton } );
+            return true;
+        }
+
+        const std::string_view svKey = PanEffectKeyAlias( svName );
         xkb_keysym_t eKeysym = PanEffectResolveKeysym( svKey );
         if ( eKeysym != XKB_KEY_NoSymbol )
         {
-            s_PanKeysyms.insert( eKeysym );
+            vTriggers.push_back( { PanEffectTrigger::Kind::Key, eKeysym } );
 
             // Either side of a modifier pair drives the effect.
             if ( eKeysym == XKB_KEY_Alt_L )
-                s_PanKeysyms.insert( XKB_KEY_Alt_R );
+                vTriggers.push_back( { PanEffectTrigger::Kind::Key, XKB_KEY_Alt_R } );
             else if ( eKeysym == XKB_KEY_Alt_R )
-                s_PanKeysyms.insert( XKB_KEY_Alt_L );
+                vTriggers.push_back( { PanEffectTrigger::Kind::Key, XKB_KEY_Alt_L } );
 
             return true;
         }
@@ -97,12 +193,12 @@ namespace gamescope
         const xkb_keysym_t eLeft = PanEffectResolveKeysym( sLeft );
         if ( eLeft != XKB_KEY_NoSymbol )
         {
-            s_PanKeysyms.insert( eLeft );
+            vTriggers.push_back( { PanEffectTrigger::Kind::Key, eLeft } );
 
             const std::string sRight = std::string( svKey ) + "_R";
             const xkb_keysym_t eRight = PanEffectResolveKeysym( sRight );
             if ( eRight != XKB_KEY_NoSymbol )
-                s_PanKeysyms.insert( eRight );
+                vTriggers.push_back( { PanEffectTrigger::Kind::Key, eRight } );
 
             return true;
         }
@@ -110,39 +206,53 @@ namespace gamescope
         return false;
     }
 
-    static void PanEffectRebuildKeyList()
+    std::vector<PanEffectTrigger> PanEffectParseTriggers( std::string_view svConfig, std::vector<std::string> &vsUnknown )
     {
-        std::lock_guard<std::mutex> lock( s_KeyMutex );
+        std::vector<PanEffectTrigger> vTriggers;
 
-        const std::string sConfig{ cv_pan_effect_key.Get() };
-        if ( sConfig == s_CachedKeyConfig )
-            return;
-
-        s_CachedKeyConfig = sConfig;
-        s_PanKeysyms.clear();
-
-        for ( std::string_view svToken : Split( sConfig, "," ) )
+        for ( std::string_view svToken : Split( svConfig, "," ) )
         {
-            // Be forgiving about "Alt, Super_L" style lists.
+            // Be forgiving about "Alt, BTN_SIDE" style lists.
             const size_t nStart = svToken.find_first_not_of( " \t" );
             if ( nStart == std::string_view::npos )
                 continue;
 
             const size_t nEnd = svToken.find_last_not_of( " \t" );
-            const std::string_view svKey = svToken.substr( nStart, nEnd - nStart + 1 );
+            const std::string_view svName = svToken.substr( nStart, nEnd - nStart + 1 );
 
-            if ( !PanEffectAddKey( PanEffectKeyAlias( svKey ) ) )
-                s_PanEffectLog.errorf( "pan_effect_key: unknown key \"%.*s\".", int( svKey.length() ), svKey.data() );
+            if ( !PanEffectAddTrigger( vTriggers, svName ) )
+                vsUnknown.emplace_back( svName );
         }
 
-        if ( s_PanKeysyms.empty() )
+        return vTriggers;
+    }
+
+    static void PanEffectRebuildTriggerList()
+    {
+        std::lock_guard<std::mutex> lock( s_TriggerMutex );
+
+        const std::string sConfig{ cv_pan_effect_key.Get() };
+        if ( sConfig == s_CachedTriggerConfig )
+            return;
+
+        s_CachedTriggerConfig = sConfig;
+        s_PanTriggers.clear();
+
+        std::vector<std::string> vsUnknown;
+        for ( const PanEffectTrigger &trigger : PanEffectParseTriggers( sConfig, vsUnknown ) )
+            s_PanTriggers.insert( trigger.Packed() );
+
+        for ( const std::string &sName : vsUnknown )
+            s_PanEffectLog.errorf( "pan_effect_key: unknown key or mouse button \"%s\".", sName.c_str() );
+
+        if ( s_PanTriggers.empty() )
             s_PanEffectLog.errorf( "pan_effect_key: no usable keys in \"%s\", the pan effect is inert.", sConfig.c_str() );
     }
 
-    static bool PanEffectIsPanKey( xkb_keysym_t eKeysym )
+    static bool PanEffectIsPanTrigger( uint64_t uTrigger )
     {
-        std::lock_guard<std::mutex> lock( s_KeyMutex );
-        return s_PanKeysyms.contains( eKeysym );
+        std::lock_guard<std::mutex> lock( s_TriggerMutex );
+        return s_PanTriggers.contains( uTrigger );
     }
 
     static void PanEffectComputeCurrentTranslation( double &flX, double &flY )
@@ -168,23 +278,64 @@ namespace gamescope
     static bool PanEffectIsActive()
     {
         // s_bPanEngaged is what drives the presentation layout: it goes true as soon as
-        // the held pan moves and stays true until the key is released, even if the
-        // translation comes back to zero in between.
+        // the held pan moves and stays true until every trigger is released, even if
+        // the translation comes back to zero in between.
         return cv_pan_effect_enabled.Get() &&
-            s_bPanKeyHeld.load( std::memory_order_relaxed ) &&
+            s_bPanTriggerHeld.load( std::memory_order_relaxed ) &&
             s_bPanEngaged.load( std::memory_order_relaxed );
     }
 
     void PanEffectReset()
     {
-        s_bPanKeyHeld.store( false, std::memory_order_relaxed );
+        {
+            std::lock_guard<std::mutex> lock( s_TriggerMutex );
+            s_HeldTriggers.clear();
+        }
+
+        s_bPanTriggerHeld.store( false, std::memory_order_relaxed );
         s_bPanEngaged.store( false, std::memory_order_relaxed );
         s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
         // The tracked pitch is deliberately left alone: it mirrors the game's camera,
         // which does not recentre just because the session paused.
     }
 
-    void PanEffectObserveKey( xkb_keysym_t eKeysym, bool bPressed )
+    // A fresh hold starts from the centre again, relative to the pitch the engine
+    // (the game's camera) is at right now.
+    static void PanEffectStartHold()
+    {
+        s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
+        s_bPanEngaged.store( false, std::memory_order_relaxed );
+        s_flPitchAtPressRad.store( s_flPitchRad.load( std::memory_order_relaxed ), std::memory_order_relaxed );
+        s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
+            std::format( "Pan hold started at pitch {:.1f} deg.",
+                s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi ) );
+    }
+
+    static void PanEffectEndHold()
+    {
+        // Log the numbers so the angle/focal length can be tuned against a
+        // known mouse movement instead of guessing.
+        const double flYawCounts = s_flPanYawCounts.load( std::memory_order_relaxed );
+        const double flPitchDeg = s_flPitchRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
+        const double flPitchAtPressDeg = s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
+        double flX = 0.0, flY = 0.0;
+        PanEffectComputeCurrentTranslation( flX, flY );
+
+        s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
+            std::format(
+                "Pan hold released, recentring. yaw={:.1f} counts -> trans=({:.1f}, {:.1f}) px "
+                "(pitch {:.1f} -> {:.1f} deg, angle={:.4f} deg/count, focal={:.1f} px)",
+                flYawCounts, flX, flY, flPitchAtPressDeg, flPitchDeg,
+                double( cv_pan_effect_angle.Get() ), double( cv_pan_effect_focal.Get() ) ) );
+
+        s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
+        s_bPanEngaged.store( false, std::memory_order_relaxed );
+    }
+
+    // The keys and buttons both land here, as their Packed() ids. The hold lasts
+    // until every configured trigger that went down has been released, so holding
+    // "Alt, Mouse4" and releasing only one of them keeps the pan alive.
+    static void PanEffectObserveTrigger( uint64_t uTrigger, bool bPressed )
     {
         if ( !cv_pan_effect_enabled.Get() )
         {
@@ -193,47 +344,40 @@ namespace gamescope
             return;
         }
 
-        PanEffectRebuildKeyList();
+        PanEffectRebuildTriggerList();
 
-        if ( !PanEffectIsPanKey( eKeysym ) )
+        if ( !PanEffectIsPanTrigger( uTrigger ) )
             return;
+
+        bool bHoldChanged = false;
+        {
+            std::lock_guard<std::mutex> lock( s_TriggerMutex );
+
+            if ( bPressed )
+                bHoldChanged = s_HeldTriggers.insert( uTrigger ).second && s_HeldTriggers.size() == 1;
+            else
+                bHoldChanged = s_HeldTriggers.erase( uTrigger ) > 0 && s_HeldTriggers.empty();
+        }
+
+        if ( !bHoldChanged )
+            return;
+
+        s_bPanTriggerHeld.store( bPressed, std::memory_order_relaxed );
 
         if ( bPressed )
-        {
-            if ( !s_bPanKeyHeld.exchange( true, std::memory_order_relaxed ) )
-            {
-                // A fresh hold starts from the centre again, relative to the pitch the
-                // engine (the game's camera) is at right now.
-                s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
-                s_bPanEngaged.store( false, std::memory_order_relaxed );
-                s_flPitchAtPressRad.store( s_flPitchRad.load( std::memory_order_relaxed ), std::memory_order_relaxed );
-                s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
-                    std::format( "Pan hold started at pitch {:.1f} deg.",
-                        s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi ) );
-            }
-            return;
-        }
+            PanEffectStartHold();
+        else
+            PanEffectEndHold();
+    }
 
-        if ( s_bPanKeyHeld.exchange( false, std::memory_order_relaxed ) )
-        {
-            // Log the numbers so the angle/focal length can be tuned against a
-            // known mouse movement instead of guessing.
-            const double flYawCounts = s_flPanYawCounts.load( std::memory_order_relaxed );
-            const double flPitchDeg = s_flPitchRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
-            const double flPitchAtPressDeg = s_flPitchAtPressRad.load( std::memory_order_relaxed ) * 180.0 / k_flPanEffectPi;
-            double flX = 0.0, flY = 0.0;
-            PanEffectComputeCurrentTranslation( flX, flY );
+    void PanEffectObserveKey( xkb_keysym_t eKeysym, bool bPressed )
+    {
+        PanEffectObserveTrigger( PanEffectTrigger{ PanEffectTrigger::Kind::Key, eKeysym }.Packed(), bPressed );
+    }
 
-            s_PanEffectLog.log( cv_pan_effect_debug.Get() ? LOG_INFO : LOG_DEBUG,
-                std::format(
-                    "Pan hold released, recentring. yaw={:.1f} counts -> trans=({:.1f}, {:.1f}) px "
-                    "(pitch {:.1f} -> {:.1f} deg, angle={:.4f} deg/count, focal={:.1f} px)",
-                    flYawCounts, flX, flY, flPitchAtPressDeg, flPitchDeg,
-                    double( cv_pan_effect_angle.Get() ), double( cv_pan_effect_focal.Get() ) ) );
-        }
-
-        s_flPanYawCounts.store( 0.0, std::memory_order_relaxed );
-        s_bPanEngaged.store( false, std::memory_order_relaxed );
+    void PanEffectObserveButton( uint32_t uButton, bool bPressed )
+    {
+        PanEffectObserveTrigger( PanEffectTrigger{ PanEffectTrigger::Kind::Button, uButton }.Packed(), bPressed );
     }
 
     bool PanEffectAccumulateMotion( double flDx, double flDy )
@@ -255,10 +399,10 @@ namespace gamescope
             PanEffectTrackPitch( s_flPitchRad.load( std::memory_order_relaxed ), flDy * flRadiansPerCount, PanEffectGetPitchLimitRad() ),
             std::memory_order_relaxed );
 
-        if ( !s_bPanKeyHeld.load( std::memory_order_relaxed ) )
+        if ( !s_bPanTriggerHeld.load( std::memory_order_relaxed ) )
             return false;
 
-        // The pan yaw accumulates while the key is held. The pan pitch is the tracked
+        // The pan yaw accumulates while a trigger is held. The pan pitch is the tracked
         // pitch itself, so the y motion is not accumulated a second time.
         s_flPanYawCounts.store( s_flPanYawCounts.load( std::memory_order_relaxed ) + flDx, std::memory_order_relaxed );
         s_bPanEngaged.store( true, std::memory_order_relaxed );

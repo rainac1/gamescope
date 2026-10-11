@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include <xkbcommon/xkbcommon.h>
 
@@ -10,30 +13,32 @@
 
 // Gamescope screen pan effect.
 //
-// While the configured key is held, relative mouse motion is accumulated as
+// While a configured trigger is held, relative mouse motion is accumulated as
 // (delta_x, delta_y) counts and the game's frame is translated in output pixels,
-// right before it is handed to the backend for presentation.
+// right before it is handed to the backend for presentation. A trigger is either
+// a keyboard key or a mouse button (see PanEffectTrigger), so eg. the right
+// button or a side button can drive the pan.
 //
-//     theta_x = k * delta_x        (pan yaw, accumulated while the key is held)
-//     theta_y = k * delta_y        (pan pitch, accumulated while the key is held)
+//     theta_x = k * delta_x        (pan yaw, accumulated while a trigger is held)
+//     theta_y = k * delta_y        (pan pitch, accumulated while a trigger is held)
 //     phi     = phi_0 + theta_y    (engine pitch now, phi_0 was the pitch the
-//                                   engine was at when the key went down)
+//                                   engine was at when the trigger went down)
 //
 //     dX = f * (sin(theta_x) / cos(phi)) / (cos(theta_x) + tan(phi_0) * tan(phi))
 //     dY = f * (tan(phi) * cos(theta_x) - tan(phi_0)) / (cos(theta_x) + tan(phi_0) * tan(phi))
 //
 // 'k' is a configurable angle per mouse count, 0.022 degrees by default, and
 // 'f' a configurable focal length in pixels, 720 by default. The engine pitch is
-// tracked at all times, key held or not, because the projection is relative to
-// where the camera was pitched when the key went down, and it saturates at
+// tracked at all times, trigger held or not, because the projection is relative to
+// where the camera was pitched when the trigger went down, and it saturates at
 // pan_effect_pitch_limit (89 degrees by default) exactly like a game's own pitch
 // clamp does. Holding the mouse against that limit is therefore also how the
 // tracked pitch can be resynchronised with the game by hand.
 //
 // The translation is snapped to whole source texels (see PanEffectSnapToTexels)
 // so that the picture is moved without being resampled. Pixels pushed outside of
-// the output are cropped and the vacated space is left black. Releasing the key
-// clears the accumulated motion, which puts the image back where it was.
+// the output are cropped and the vacated space is left black. Releasing the
+// trigger clears the accumulated motion, which puts the image back where it was.
 namespace gamescope
 {
     // tan() has a pole at +-90 degrees, so angles are clamped just short of it.
@@ -160,20 +165,54 @@ namespace gamescope
         return std::round( flTranslationPx * flTexelsPerPx ) / flTexelsPerPx;
     }
 
+    // What can drive the pan: a keyboard key (an xkb_keysym_t) or a mouse button
+    // (a Linux input event code, BTN_LEFT and friends). The two live in separate
+    // namespaces, so the kind is part of the identity.
+    struct PanEffectTrigger
+    {
+        enum class Kind : uint8_t
+        {
+            Key,
+            Button,
+        };
+
+        Kind eKind = Kind::Key;
+        uint32_t uCode = 0;
+
+        bool operator==( const PanEffectTrigger & ) const = default;
+
+        // Identity as a single integer, so a set of triggers needs no custom hash.
+        constexpr uint64_t Packed() const
+        {
+            return ( uint64_t( eKind ) << 32 ) | uCode;
+        }
+    };
+
+    // Parse a pan_effect_key value: a comma separated list of keysym names or
+    // mouse button names. A name that is neither is appended to vsUnknown. Exposed
+    // for the unit tests.
+    std::vector<PanEffectTrigger> PanEffectParseTriggers( std::string_view svConfig, std::vector<std::string> &vsUnknown );
+
     // Observe a keyboard event. Called with the wlserver lock held.
     void PanEffectObserveKey( xkb_keysym_t eKeysym, bool bPressed );
 
+    // Observe a mouse button event (a Linux input event code, BTN_RIGHT and
+    // friends). Called with the wlserver lock held. Like the key, the button is
+    // observed and never consumed: the game still sees it.
+    void PanEffectObserveButton( uint32_t uButton, bool bPressed );
+
     // Accumulate relative pointer motion. Called with the wlserver lock held. The
     // engine pitch always follows the y motion, the pan yaw only accumulates while
-    // the pan key is held. Returns true when the held pan moved, ie. when the frame
-    // needs to be redrawn for it.
+    // a pan trigger is held. Returns true when the held pan moved, ie. when the
+    // frame needs to be redrawn for it.
     bool PanEffectAccumulateMotion( double flDx, double flDy );
 
     // Current translation in output pixels. Callable from any thread. Returns false
-    // when nothing should be applied (key not held, the held pan has not moved yet,
-    // or the effect is disabled). Once it has returned true for a hold it keeps
-    // returning true until the key is released, so that the presentation layout can
-    // stay put even on the frames where the translation lands back on zero.
+    // when nothing should be applied (no trigger held, the held pan has not moved
+    // yet, or the effect is disabled). Once it has returned true for a hold it keeps
+    // returning true until every trigger is released, so that the presentation
+    // layout can stay put even on the frames where the translation lands back on
+    // zero.
     bool PanEffectGetTranslation( double &flX, double &flY );
 
     // Clamp the accumulated pan yaw so that the translation stays within
@@ -184,7 +223,7 @@ namespace gamescope
     // not accumulated for the pan, so it needs no equivalent.
     void PanEffectLimitTranslation( double flMinX, double flMaxX );
 
-    // Forget the held key and the accumulated motion, eg. when the session
+    // Forget the held triggers and the accumulated motion, eg. when the session
     // pauses and we can no longer see the matching release.
     void PanEffectReset();
 }

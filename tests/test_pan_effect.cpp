@@ -2,6 +2,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <string>
+#include <vector>
+
+#include <linux/input-event-codes.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "PanEffect.h"
 
@@ -237,4 +242,110 @@ TEST_CASE("PanEffectSnapToTexels", "[pan_effect]") {
 
 	// A layer without a texture extent is left alone instead of dividing by zero.
 	REQUIRE(PanEffectSnapToTexels(12.5, 0.0) == 12.5);
+}
+
+static PanEffectTrigger ParseOne(const std::string &sConfig)
+{
+	std::vector<std::string> vsUnknown;
+	const std::vector<PanEffectTrigger> triggers = PanEffectParseTriggers(sConfig, vsUnknown);
+	REQUIRE(vsUnknown.empty());
+	REQUIRE(triggers.size() == 1);
+	return triggers[0];
+}
+
+TEST_CASE("PanEffectParseTriggers", "[pan_effect]") {
+	// A keysym still works, and a bare modifier expands to both of its sides.
+	{
+		std::vector<std::string> vsUnknown;
+		const auto triggers = PanEffectParseTriggers("Alt", vsUnknown);
+		REQUIRE(vsUnknown.empty());
+		REQUIRE(triggers.size() == 2);
+		REQUIRE(triggers[0] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Alt_L });
+		REQUIRE(triggers[1] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Alt_R });
+	}
+
+	// The existing aliases keep working. A bare modifier has no keysym of its own,
+	// so it comes out as both of its sides.
+	REQUIRE(ParseOne("Super_L") == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Super_L });
+	{
+		std::vector<std::string> vsUnknown;
+		const auto ctrl = PanEffectParseTriggers("Ctrl", vsUnknown);
+		REQUIRE(vsUnknown.empty());
+		REQUIRE(ctrl.size() == 2);
+		REQUIRE(ctrl[0] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Control_L });
+		REQUIRE(ctrl[1] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Control_R });
+
+		const auto win = PanEffectParseTriggers("win", vsUnknown);
+		REQUIRE(vsUnknown.empty());
+		REQUIRE(win.size() == 2);
+		REQUIRE(win[0] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Super_L });
+		REQUIRE(win[1] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Super_R });
+	}
+
+	// Mouse buttons, by their Linux input names.
+	REQUIRE(ParseOne("BTN_RIGHT") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_RIGHT });
+	REQUIRE(ParseOne("BTN_SIDE") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_SIDE });
+	REQUIRE(ParseOne("BTN_EXTRA") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_EXTRA });
+
+	// Names are case insensitive, and the friendly spellings resolve too.
+	REQUIRE(ParseOne("btn_middle") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_MIDDLE });
+	REQUIRE(ParseOne("MouseLeft") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_LEFT });
+	REQUIRE(ParseOne("Mouseright") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_RIGHT });
+	REQUIRE(ParseOne("mouse4") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_SIDE });
+	REQUIRE(ParseOne("Mouse5") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_EXTRA });
+	REQUIRE(ParseOne("mouse3") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_RIGHT });
+
+	// A raw code is the escape hatch for buttons that have no name here.
+	REQUIRE(ParseOne("button:275") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_SIDE });
+	REQUIRE(ParseOne("Button:0x113") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_SIDE });
+
+	// A malformed one is reported, not read as some wrapped-around code.
+	{
+		std::vector<std::string> vsUnknown;
+		REQUIRE(PanEffectParseTriggers("button:", vsUnknown).empty());
+		REQUIRE(PanEffectParseTriggers("button:-1", vsUnknown).empty());
+		REQUIRE(PanEffectParseTriggers("button:0x11g", vsUnknown).empty());
+		REQUIRE(vsUnknown.size() == 3);
+	}
+
+	// A list mixes keys and buttons, is forgiving about spaces, and skips empty
+	// entries instead of reporting them.
+	{
+		std::vector<std::string> vsUnknown;
+		const auto triggers = PanEffectParseTriggers(" Super_L , BTN_EXTRA,Mouse3 ,, ", vsUnknown);
+		REQUIRE(vsUnknown.empty());
+		REQUIRE(triggers.size() == 3);
+		REQUIRE(triggers[0] == PanEffectTrigger{ PanEffectTrigger::Kind::Key, XKB_KEY_Super_L });
+		REQUIRE(triggers[1] == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_EXTRA });
+		REQUIRE(triggers[2] == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_RIGHT });
+	}
+
+	// Unknown names are reported rather than silently dropped.
+	{
+		std::vector<std::string> vsUnknown;
+		const auto triggers = PanEffectParseTriggers("Alt, NotAThing", vsUnknown);
+		REQUIRE(triggers.size() == 2);
+		REQUIRE(vsUnknown == std::vector<std::string>{ "NotAThing" });
+	}
+
+	// Nothing at all is not an error, it just leaves the effect inert.
+	{
+		std::vector<std::string> vsUnknown;
+		REQUIRE(PanEffectParseTriggers("", vsUnknown).empty());
+		REQUIRE(PanEffectParseTriggers(" , ,, ", vsUnknown).empty());
+		REQUIRE(vsUnknown.empty());
+	}
+
+	// A bare "forward" is not the button: the BTN_/Mouse prefix is what says a name
+	// is a mouse button, and xkb does not know the bare word either.
+	{
+		std::vector<std::string> vsUnknown;
+		REQUIRE(PanEffectParseTriggers("forward", vsUnknown).empty());
+		REQUIRE(vsUnknown == std::vector<std::string>{ "forward" });
+	}
+	REQUIRE(ParseOne("BTN_FORWARD") == PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_FORWARD });
+
+	// A key and a button never collide, even at the same numeric code.
+	REQUIRE(PanEffectTrigger{ PanEffectTrigger::Kind::Key, BTN_RIGHT }.Packed() !=
+	        PanEffectTrigger{ PanEffectTrigger::Kind::Button, BTN_RIGHT }.Packed());
 }

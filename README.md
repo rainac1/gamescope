@@ -81,19 +81,19 @@ See `gamescope --help` for a full list of options.
 
 ## Screen pan effect
 
-The engine pitch is tracked at all times: every y mouse movement, pan key held or
-not, moves `phi_pitch`, and it saturates at `--pan-effect-pitch-limit`
+The engine pitch is tracked at all times: every y mouse movement, pan trigger held
+or not, moves `phi_pitch`, and it saturates at `--pan-effect-pitch-limit`
 (`pan_effect_pitch_limit`, 89 degrees by default) the same way a game's own pitch
 clamp does.
 
-While the pan key is held, mouse motion accumulates into `(delta_x, delta_y)`
+While a pan trigger is held, mouse motion accumulates into `(delta_x, delta_y)`
 counts and the game's frame is translated in output pixels right before it is
-presented, relative to the pitch the engine was at when the key went down
+presented, relative to the pitch the engine was at when the trigger went down
 (`phi_0`):
 
 ```
-theta_x = k * delta_x              (pan yaw, accumulated while the key is held)
-theta_y = k * delta_y              (pan pitch, accumulated while the key is held)
+theta_x = k * delta_x              (pan yaw, accumulated while a trigger is held)
+theta_y = k * delta_y              (pan pitch, accumulated while a trigger is held)
 phi     = phi_0 + theta_y          (engine pitch now)
 
          sin(theta_x) / cos(phi)
@@ -110,14 +110,14 @@ and of opposite sign, yaw out towards 90 degrees). The yaw is held on the near
 side of it, so the translation stays finite and does not flip sign.
 
 Pixels pushed outside of the output are cropped and the vacated space is left
-black. Releasing the key clears the accumulated motion, so the picture returns
+black. Releasing the trigger clears the accumulated motion, so the picture returns
 to where it was. The tracked pitch is of course not cleared: it is where the
 game's camera is looking.
 
 * `k` is `--pan-effect-angle` / `pan_effect_angle`, in degrees per mouse count, `0.022` by default.
 * `f` is `--pan-effect-focal` / `pan_effect_focal`, in pixels, `720` by default.
 * The engine pitch limit is `--pan-effect-pitch-limit` / `pan_effect_pitch_limit`, in degrees, `89` by default.
-* The key is `--pan-effect-key` / `pan_effect_key`: an xkb keysym name or a comma separated list. `Alt`, `Super`, `Shift`, `Control`, `Meta` and `Hyper` expand to both the left and right variants, and `Ctrl`/`Win` are accepted as aliases.
+* The trigger is `--pan-effect-key` / `pan_effect_key`: a key or a mouse button (`BTN_RIGHT` by default), or a comma separated list of them. A key is an xkb keysym name; `Alt`, `Super`, `Shift`, `Control`, `Meta` and `Hyper` expand to both the left and right variants, and `Ctrl`/`Win` are accepted as aliases. A mouse button is a Linux input name: `BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`, `BTN_FORWARD`, `BTN_BACK`, `BTN_TASK`, or `MouseLeft`, `MouseRight`, `MouseMiddle`, `MouseSide`, `MouseExtra`, `MouseForward`, `MouseBack`, `MouseTask`, or `Mouse1`..`Mouse8` in that order (`Mouse1`/`Mouse2`/`Mouse3` are the left/middle/right buttons, so eg. `Mouse4` and `Mouse5` are the two side buttons). Names are case insensitive, and `button:<code>` takes a raw Linux button code in decimal or `0x` hex (`button:275` is `BTN_SIDE`) for buttons that are not named. The trigger is observed but never consumed, so the game still sees the key or the click.
 * A positive `delta_x` yaws the world right and a positive `delta_y` pitches it down. Use `--pan-effect-invert` / `pan_effect_invert` for the opposite direction.
 * `--pan-effect-disable` or `pan_effect_enabled=0` turns the effect off.
 * `pan_effect_debug=1` (no command line flag) prints the pan counts, the pitch
@@ -137,7 +137,7 @@ the limit). Do that before panning and the projection has a known `phi_0`.
 The translation is snapped to whole source texels, so the game's frame is moved
 without being resampled: the pan itself introduces no interpolation blur, and a
 layer that is already 1:1 with the output moves in whole output pixels. Holding
-the key without moving, or with less than half a texel of motion, applies
+the trigger without moving, or with less than half a texel of motion, applies
 nothing at all.
 
 It is also clamped to half of the output in each direction, so the picture always
@@ -235,8 +235,8 @@ All of the options above are ordinary convars, reachable three ways:
   callback.
 
 While tuning, a good workflow is to resynchronise the pitch first (see above),
-then hold the key and move the mouse a fixed distance on the pad, and read the
-numbers back:
+then hold the trigger and move the mouse a fixed distance on the pad, and read
+the numbers back:
 
 ```
 $ gamescope_pan_effect_debug=true gamescope -- glxgears

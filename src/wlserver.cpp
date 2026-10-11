@@ -387,6 +387,9 @@ static void wlserver_handle_pointer_button(struct wl_listener *listener, void *d
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, button );
 	struct wlr_pointer_button_event *event = (struct wlr_pointer_button_event *) data;
 
+	// The pan button is observed, never consumed: the game still sees it.
+	gamescope::PanEffectObserveButton( event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED );
+
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, event->button, event->state );
 	wlserver_drag_anchor_release();
 }
@@ -3177,6 +3180,9 @@ void wlserver_mousebutton( int button, bool press, uint32_t time )
 	wlserver.bCursorHidden = !wlserver.bCursorHasImage;
 
 	wlserver_oncursorevent();
+
+	// The pan button is observed, never consumed: the game still sees it.
+	gamescope::PanEffectObserveButton( uint32_t( button ), press );
 
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, press ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
