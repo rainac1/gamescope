@@ -1141,8 +1141,16 @@ namespace gamescope
             // exact for a 1:1 layer, whose offset is a whole output pixel: a scaled
             // layer would be moved by whole output pixels and sampled at a shifting
             // texel phase, so it keeps going through the composite, which stays locked
-            // to whole source texels.
-            const bool bPlaneCanMoveBaseLayer = close_enough( pFrameInfo->layers.get( 0 ).scale.x, 1.0f ) && close_enough( pFrameInfo->layers.get( 0 ).scale.y, 1.0f );
+            // to whole source texels. The same goes for a host that scales the window by
+            // a fraction: a subsurface can only be moved by whole logical pixels, so on
+            // a 1.75x output our whole pixel offsets can only land on 1.75 output pixel
+            // steps, which puts the layer at a fractional output pixel and makes the
+            // host interpolate it there. Compositing keeps the pan inside one surface,
+            // whose own position never moves, so the phase stays put.
+            const bool bPlaneCanMoveBaseLayer =
+                close_enough( pFrameInfo->layers.get( 0 ).scale.x, 1.0f ) &&
+                close_enough( pFrameInfo->layers.get( 0 ).scale.y, 1.0f ) &&
+                m_Planes[0].GetScale() == WL_FRACTIONAL_SCALE_DENOMINATOR;
             bNeedsFullComposite |= pFrameInfo->bPanEffectEngaged && !bPlaneCanMoveBaseLayer;
 
             if ( g_bOutputHDREnabled )

@@ -152,10 +152,38 @@ first unwinding the excess.
 While the effect is engaged the frame is always presented the same way, even on
 the frames where the translation snaps away to nothing, so crossing a texel
 boundary cannot make the presentation path flip back and forth. A 1:1 layer in a
-nested session is then presented with no compositing at all: it is moved by its
-own plane, with the black backing plane below it. Scaled layers, and DRM or
-OpenVR sessions, keep going through the composite, which is still sampled at
-whole source texels.
+nested session whose host is not scaling the window is then presented with no
+compositing at all: it is moved by its own plane, with the black backing plane
+below it. Everything else - scaled layers, DRM and OpenVR sessions, and a nested
+session on a host that scales the window - keeps going through the composite,
+which is still sampled at whole source texels.
+
+### Nested sessions and the host's scale
+
+gamescope already does the scaling itself in a nested session: it asks the host
+for its scale (`wp_fractional_scale_v1`), renders its output at the resulting
+*physical* size, and hands the host a `wp_viewport` whose destination is the
+*logical* size. The host only places that.
+
+A plane, however, can only be moved by whole logical pixels, while the pan moves
+the layer by whole output pixels. Those are the same grid only when the host is
+not scaling the window, ie. one logical pixel is one output pixel. At a host
+scale of 1.75 one logical pixel is 1.75 output pixels, so the pan's whole pixel
+offsets are rounded (up, `WaylandScaleToLogical`) onto that coarser grid, and
+the layer ends up between output pixels - half a pixel off for some offsets -
+where the host has to interpolate it. That is a blur that comes and goes as the
+pan moves. At an integer host scale above 1 the offsets do land on whole output
+pixels, but only every `scale` output pixels, which would make the pan step by
+that much. The pan is therefore composited whenever the host scales the window
+at all, which keeps the translation inside a single surface whose own position
+never moves.
+
+For the same reason, a host scale that does not divide the panel leaves even the
+composite slightly soft: the host derives the physical size from the logical size
+it reports, and a 2560x1600 panel at 1.75 is 1462.86x914.29 logical, which it
+rounds to 1463x915, a 0.01% x 0.08% resample. Host scales that divide the panel
+exactly - 125%, 160% and 200% for 2560x1600 - have no such residue, and the pan
+is then pixel exact.
 
 ### Where the counts come from
 
